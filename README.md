@@ -1,4 +1,4 @@
-```markdown
+
 # 🦅 Orion AI - OmniNode
 
 > **Version:** V1.0 | **Size:** 4GB | **Source:** 🔒 Private
