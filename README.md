@@ -6,6 +6,7 @@
 [![GGUF](https://img.shields.io/badge/Format-GGUF-blue)](https://github.com/ggerganov/llama.cpp)
 [![Ollama](https://img.shields.io/badge/Ollama-Ready-green)](https://ollama.com/OmniNode/Orion)
 [![License](https://img.shields.io/badge/License-Custom-red)](LICENSE)
+[![Latest Version](https://img.shields.io/badge/V1.1-green)](https://ollama.com/OmniNode/Orion)
 
 ---
 
