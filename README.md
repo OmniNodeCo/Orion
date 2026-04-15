@@ -24,8 +24,8 @@
 
 ### Option 1: Ollama (Recommended)
 ```bash
-ollama pull OmniNode/Orion
-ollama run OmniNode/Orion
+ollama pull OmniNode/Orion:V1.0
+ollama run OmniNode/Orion:V1.0
 ```
 
 ### Option 2: Direct Download
@@ -45,7 +45,7 @@ git clone https://github.com/OmniNodeCo/Orion.git
 
 ### Ollama
 ```bash
-ollama run OmniNode/Orion
+ollama run OmniNode/Orion:V1.0
 ```
 
 ### llama.cpp / Python
