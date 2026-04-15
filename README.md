@@ -1,7 +1,7 @@
 
 # 🦅 Orion AI - OmniNode
 
-> **Version:** V1.0 | **Size:** 4GB | **Source:** 🔒 Private
+> **Version:** V1.1 | **Size:** 4GB | **Source:** 🔒 Private
 
 [![GGUF](https://img.shields.io/badge/Format-GGUF-blue)](https://github.com/ggerganov/llama.cpp)
 [![Ollama](https://img.shields.io/badge/Ollama-Ready-green)](https://ollama.com/OmniNode/Orion)
@@ -24,8 +24,8 @@
 
 ### Option 1: Ollama (Recommended)
 ```bash
-ollama pull OmniNode/Orion:V1.0
-ollama run OmniNode/Orion:V1.0
+ollama pull OmniNode/Orion:V1.1
+ollama run OmniNode/Orion:V1.1
 ```
 
 ### Option 2: Direct Download
@@ -35,7 +35,7 @@ git lfs install
 git clone https://github.com/OmniNodeCo/Orion.git
 ```
 
-**File:** `Orion-V1.0.gguf` (4.0 GB)  
+**File:** `Orion-V1.1.gguf` (4.0 GB)  
 **Format:** GGUF (llama.cpp compatible)  
 **Context:** 4096 tokens  
 
@@ -45,7 +45,7 @@ git clone https://github.com/OmniNodeCo/Orion.git
 
 ### Ollama
 ```bash
-ollama run OmniNode/Orion:V1.0
+ollama run OmniNode/Orion:V1.1
 ```
 
 ### llama.cpp / Python
@@ -53,7 +53,7 @@ ollama run OmniNode/Orion:V1.0
 from llama_cpp import Llama
 
 model = Llama(
-    model_path="Orion-V1.0.gguf",
+    model_path="Orion-V1.1.gguf",
     n_ctx=4096,
     n_gpu_layers=-1
 )
@@ -72,8 +72,8 @@ print(output["choices"][0]["text"])
 
 | Attribute | Value |
 |-----------|-------|
-| **Model** | Orion V1.0 |
-| **File** | Orion-V1.0.gguf |
+| **Model** | Orion V1.1 |
+| **File** | Orion-V1.1.gguf |
 | **Size** | 4.0 GB |
 | **Context** | 4096 tokens |
 | **Parameters** | [Private] |
@@ -114,7 +114,7 @@ All rights reserved.
 1. DEFINITIONS
 ================================================================================
 
-"The Model" refers to the file "Orion-V1.0.gguf" distributed in the GitHub 
+"The Model" refers to the file "Orion-V1.1.gguf" distributed in the GitHub 
 repository at https://github.com/OmniNodeCo/Orion.
 
 "Source Code" refers to all training scripts, data pipelines, model architecture 
@@ -172,10 +172,10 @@ For >1000 daily users, contact for enterprise license.
 ================================================================================
 
 Required notice:
-"This uses Orion V1.0 by OmniNode (https://github.com/OmniNodeCo/Orion)"
+"This uses Orion V1.1 by OmniNode (https://github.com/OmniNodeCo/Orion)"
 
 Academic cite:
-"OmniNode. (2024). Orion V1.0 [Model]. https://github.com/OmniNodeCo/Orion"
+"OmniNode. (2024). Orion V1.1 [Model]. https://github.com/OmniNodeCo/Orion"
 
 ================================================================================
 7. TERMINATION
@@ -198,7 +198,7 @@ Governed by applicable local law.
 
 ================================================================================
 
-BY DOWNLOADING ORION-V1.0.GGUF, YOU ACCEPT THESE TERMS.
+BY DOWNLOADING ORION-V1.1.GGUF, YOU ACCEPT THESE TERMS.
 
 Contact: https://github.com/OmniNodeCo/Orion/issues
 ```
