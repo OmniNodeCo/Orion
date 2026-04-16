@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orion AI</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <span class="logo-icon">◉</span>
+                    <span class="logo-text">ORION</span>
+                </div>
+                <span class="version">v1.1</span>
+            </div>
+
+            <div class="model-selector">
+                <label>MODEL</label>
+                <select id="modelSelect">
+                    <option value="OmniNode/Orion:V1.1">Orion V1.1</option>
+                </select>
+            </div>
+
+            <button class="new-chat-btn" onclick="newChat()">
+                + New Chat
+            </button>
+
+            <!-- Model Manager Button -->
+            <button class="model-manager-btn" onclick="openModelManager()">
+                📦 Model Manager
+            </button>
+
+            <div class="chat-history" id="chatHistory">
+                <label>HISTORY</label>
+            </div>
+
+            <div class="sidebar-footer">
+                <div class="system-status">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span id="statusText">Checking...</span>
+                </div>
+                <span class="footer-text">by OmniNode</span>
+            </div>
+        </div>
+
+        <!-- Main Chat -->
+        <div class="main-chat">
+            <div class="chat-header">
+                <button class="menu-btn" onclick="toggleSidebar()">☰</button>
+                <div class="header-info">
+                    <h1>Orion AI</h1>
+                    <span class="header-model" id="headerModel">OmniNode/Orion:V1.1</span>
+                </div>
+                <button class="update-btn" onclick="openModelManager()" title="Model Manager">📦</button>
+                <button class="clear-btn" onclick="clearChat()">🗑 Clear</button>
+            </div>
+
+            <div class="chat-messages" id="chatMessages">
+                <div class="welcome-screen" id="welcomeScreen">
+                    <div class="welcome-icon">◉</div>
+                    <h2>Welcome to Orion</h2>
+                    <p>Shy, calm, and concise AI assistant by OmniNode</p>
+                    <div class="welcome-hints">
+                        <div class="hint" onclick="sendHint('Hello Orion')">👋 Say Hello</div>
+                        <div class="hint" onclick="sendHint('What can you do?')">🧠 Capabilities</div>
+                        <div class="hint" onclick="sendHint('Write me a Python script')">💻 Code Help</div>
+                        <div class="hint" onclick="sendHint('Tell me a fun fact')">🎯 Fun Fact</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input-container">
+                <div class="input-wrapper">
+                    <textarea
+                        id="chatInput"
+                        placeholder="Message Orion..."
+                        rows="1"
+                        onkeydown="handleKey(event)"
+                        oninput="autoResize(this)"
+                    ></textarea>
+                    <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                        ▶
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Model Manager Modal -->
+    <div class="modal-overlay" id="modelManagerModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>📦 Model Manager</h2>
+                <button class="modal-close" onclick="closeModelManager()">✕</button>
+            </div>
+
+            <div class="modal-actions">
+                <button class="check-all-btn" id="checkAllBtn" onclick="checkAllUpdates()">
+                    🔄 Check All Updates
+                </button>
+                <button class="update-all-btn" id="updateAllBtn" onclick="updateAllModels()" style="display:none;">
+                    ⬇️ Update All
+                </button>
+            </div>
+
+            <div class="modal-body" id="modelList">
+                <div class="loading-models">Loading models...</div>
+            </div>
+
+            <div class="modal-footer">
+                <span class="modal-footer-text" id="modalFooterText">Click "Check All Updates" to scan</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
