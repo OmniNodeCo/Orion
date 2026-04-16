@@ -2,7 +2,7 @@
 
 # ==========================================
 #  Orion GUI - Linux Installer
-#  Builds and installs AppImage locally
+#  Downloads pre-built binary from GitHub
 #  by OmniNode
 # ==========================================
 
@@ -20,14 +20,13 @@ NC='\033[0m'
 
 # Config
 APP_NAME="OrionGUI"
-APP_VERSION="1.1.0"
+GITHUB_REPO="OmniNodeCo/Orion"
+GITHUB_API="https://api.github.com/repos/$GITHUB_REPO/releases"
 INSTALL_DIR="$HOME/.local/share/OrionGUI"
 BIN_DIR="$HOME/.local/bin"
 DESKTOP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
-APPIMAGE_DIR="$HOME/.local/share/OrionGUI"
-VENV_DIR="$INSTALL_DIR/venv"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARCH=$(uname -m)
 
 # Detect pipe
 IS_PIPED=false
@@ -43,8 +42,8 @@ print_banner() {
     echo -e "${PURPLE}"
     echo "╔══════════════════════════════════════════╗"
     echo "║                                          ║"
-    echo "║      ◉  ORION GUI LOCAL INSTALLER        ║"
-    echo "║            by OmniNode                   ║"
+    echo "║       ◉  ORION GUI INSTALLER             ║"
+    echo "║           by OmniNode                    ║"
     echo "║                                          ║"
     echo "╚══════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -91,13 +90,24 @@ check_system() {
         exit 1
     fi
     log_success "OS: Linux $(uname -r)"
-
-    ARCH=$(uname -m)
     log_success "Architecture: $ARCH"
 
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         log_success "Distro: $NAME $VERSION_ID"
+    fi
+
+    # Check curl or wget
+    if command -v curl &>/dev/null; then
+        DOWNLOADER="curl"
+        log_success "Downloader: curl"
+    elif command -v wget &>/dev/null; then
+        DOWNLOADER="wget"
+        log_success "Downloader: wget"
+    else
+        log_error "curl or wget required"
+        log_info "Install: sudo apt install curl"
+        exit 1
     fi
 
     if [ "$EUID" -eq 0 ]; then
@@ -106,106 +116,322 @@ check_system() {
         BIN_DIR="/usr/local/bin"
         DESKTOP_DIR="/usr/share/applications"
         ICON_DIR="/usr/share/icons/hicolor/256x256/apps"
-        APPIMAGE_DIR="/opt/OrionGUI"
-        VENV_DIR="$INSTALL_DIR/venv"
     fi
 }
 
 # ==========================================
-# DETECT PACKAGE MANAGER
+# FETCH RELEASES FROM GITHUB
 # ==========================================
 
-detect_package_manager() {
-    if command -v apt-get &>/dev/null; then echo "apt"
-    elif command -v dnf &>/dev/null; then echo "dnf"
-    elif command -v yum &>/dev/null; then echo "yum"
-    elif command -v pacman &>/dev/null; then echo "pacman"
-    elif command -v zypper &>/dev/null; then echo "zypper"
-    elif command -v apk &>/dev/null; then echo "apk"
-    else echo "unknown"
-    fi
-}
+fetch_releases() {
+    log_step "Fetching Available Versions"
 
-install_package() {
-    local pkg="$1"
-    local PM=$(detect_package_manager)
-    log_info "Installing $pkg..."
+    log_info "Checking GitHub releases..."
 
-    case $PM in
-        apt)    sudo apt-get update -qq 2>/dev/null; sudo apt-get install -y -qq $pkg 2>/dev/null ;;
-        dnf)    sudo dnf install -y -q $pkg 2>/dev/null ;;
-        yum)    sudo yum install -y -q $pkg 2>/dev/null ;;
-        pacman) sudo pacman -S --noconfirm --quiet $pkg 2>/dev/null ;;
-        zypper) sudo zypper install -y -q $pkg 2>/dev/null ;;
-        apk)    sudo apk add --quiet $pkg 2>/dev/null ;;
-        *)      log_error "Unknown package manager. Install $pkg manually."; return 1 ;;
-    esac
-}
-
-# ==========================================
-# CHECK DEPENDENCIES
-# ==========================================
-
-check_dependencies() {
-    log_step "Checking Dependencies"
-
-    # Python
-    PYTHON_CMD=""
-    if command -v python3 &>/dev/null; then
-        PYTHON_CMD="python3"
-    elif command -v python &>/dev/null; then
-        PYTHON_CMD="python"
+    local RELEASES_JSON=""
+    if [ "$DOWNLOADER" = "curl" ]; then
+        RELEASES_JSON=$(curl -sL "$GITHUB_API" 2>/dev/null)
     else
-        log_warn "Python 3 not found. Installing..."
-        local PM=$(detect_package_manager)
-        case $PM in
-            apt) install_package "python3 python3-pip python3-venv python3-dev" ;;
-            dnf|yum) install_package "python3 python3-pip python3-devel" ;;
-            pacman) install_package "python python-pip" ;;
-            zypper) install_package "python3 python3-pip python3-devel" ;;
-            apk) install_package "python3 py3-pip python3-dev" ;;
-        esac
-        PYTHON_CMD="python3"
+        RELEASES_JSON=$(wget -qO- "$GITHUB_API" 2>/dev/null)
     fi
 
-    PYTHON_VERSION=$($PYTHON_CMD --version 2>&1 | cut -d' ' -f2)
-    log_success "Python: $PYTHON_VERSION"
-
-    # Check Python version
-    PYTHON_MAJOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.major)")
-    PYTHON_MINOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.minor)")
-    if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 8 ]); then
-        log_error "Python 3.8+ required. Found: $PYTHON_VERSION"
+    if [ -z "$RELEASES_JSON" ] || echo "$RELEASES_JSON" | grep -q "API rate limit"; then
+        log_error "Could not fetch releases from GitHub"
+        log_info "Check: https://github.com/$GITHUB_REPO/releases"
         exit 1
     fi
 
-    # pip
-    if ! $PYTHON_CMD -m pip --version &>/dev/null; then
-        log_warn "pip not found. Installing..."
-        $PYTHON_CMD -m ensurepip --upgrade 2>/dev/null || \
-        curl -sS https://bootstrap.pypa.io/get-pip.py | $PYTHON_CMD 2>/dev/null
-    fi
-    log_success "pip: $($PYTHON_CMD -m pip --version 2>&1 | cut -d' ' -f2)"
+    # Parse releases using python (available on most Linux)
+    if command -v python3 &>/dev/null; then
+        AVAILABLE_VERSIONS=$(echo "$RELEASES_JSON" | python3 -c "
+import sys, json
+try:
+    releases = json.load(sys.stdin)
+    if isinstance(releases, list):
+        for r in releases[:10]:
+            tag = r.get('tag_name', '')
+            name = r.get('name', '')
+            pre = r.get('prerelease', False)
+            date = r.get('published_at', '')[:10]
+            assets = len(r.get('assets', []))
+            marker = ' (pre-release)' if pre else ''
+            print(f'{tag}|{name}|{date}|{assets}{marker}')
+except: pass
+" 2>/dev/null)
 
-    # venv
-    if ! $PYTHON_CMD -m venv --help &>/dev/null 2>&1; then
-        log_warn "python3-venv not found. Installing..."
-        local PM=$(detect_package_manager)
-        case $PM in
-            apt) install_package "python3-venv" ;;
-        esac
+        LATEST_VERSION=$(echo "$RELEASES_JSON" | python3 -c "
+import sys, json
+try:
+    releases = json.load(sys.stdin)
+    if isinstance(releases, list):
+        for r in releases:
+            if not r.get('prerelease', False):
+                print(r.get('tag_name', ''))
+                break
+except: pass
+" 2>/dev/null)
+
+        # Get download URLs for latest
+        DOWNLOAD_URLS=$(echo "$RELEASES_JSON" | python3 -c "
+import sys, json
+try:
+    releases = json.load(sys.stdin)
+    if isinstance(releases, list):
+        for r in releases:
+            if r.get('tag_name', '') == '$LATEST_VERSION' or not r.get('prerelease', False):
+                for a in r.get('assets', []):
+                    name = a.get('name', '')
+                    url = a.get('browser_download_url', '')
+                    size = a.get('size', 0)
+                    size_mb = round(size / 1024 / 1024, 1)
+                    print(f'{name}|{url}|{size_mb}')
+                break
+except: pass
+" 2>/dev/null)
+    else
+        # Fallback: use grep
+        LATEST_VERSION=$(echo "$RELEASES_JSON" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)
+        DOWNLOAD_URLS=""
     fi
 
-    # curl
-    if ! command -v curl &>/dev/null; then
-        install_package "curl"
+    if [ -z "$LATEST_VERSION" ]; then
+        log_error "No releases found"
+        log_info "Check: https://github.com/$GITHUB_REPO/releases"
+        exit 1
     fi
-    log_success "curl: found"
 
-    # binutils (for strip, optional)
-    if ! command -v strip &>/dev/null; then
-        install_package "binutils" 2>/dev/null || true
+    log_success "Latest version: $LATEST_VERSION"
+
+    if [ -n "$AVAILABLE_VERSIONS" ]; then
+        echo ""
+        echo -e "${WHITE}Available versions:${NC}"
+        local COUNT=0
+        while IFS='|' read -r tag name date assets extra; do
+            COUNT=$((COUNT + 1))
+            echo -e "  ${CYAN}$COUNT)${NC} $tag  ($date, $assets files) $extra"
+        done <<< "$AVAILABLE_VERSIONS"
+        echo ""
     fi
+}
+
+# ==========================================
+# SELECT VERSION
+# ==========================================
+
+select_version() {
+    local SELECTED_VERSION="$LATEST_VERSION"
+
+    if [ "$IS_PIPED" = true ]; then
+        log_info "Auto-selecting latest: $LATEST_VERSION"
+    elif [ -n "$1" ]; then
+        SELECTED_VERSION="$1"
+        log_info "Using specified version: $SELECTED_VERSION"
+    else
+        echo -e "${WHITE}Options:${NC}"
+        echo "  1) Install latest ($LATEST_VERSION)"
+        echo "  2) Choose a different version"
+        echo ""
+
+        local VERSION_CHOICE
+        safe_read "Choice (1-2): " VERSION_CHOICE "1"
+
+        if [ "$VERSION_CHOICE" = "2" ] && [ -n "$AVAILABLE_VERSIONS" ]; then
+            echo ""
+            echo -e "${WHITE}Available versions:${NC}"
+            local VERSIONS_ARRAY=()
+            local COUNT=0
+            while IFS='|' read -r tag name date assets extra; do
+                COUNT=$((COUNT + 1))
+                VERSIONS_ARRAY+=("$tag")
+                echo -e "  ${CYAN}$COUNT)${NC} $tag  ($date) $extra"
+            done <<< "$AVAILABLE_VERSIONS"
+            echo ""
+
+            local VER_NUM
+            safe_read "Enter number: " VER_NUM "1"
+
+            local IDX=$((VER_NUM - 1))
+            if [ $IDX -ge 0 ] && [ $IDX -lt ${#VERSIONS_ARRAY[@]} ]; then
+                SELECTED_VERSION="${VERSIONS_ARRAY[$IDX]}"
+            fi
+        fi
+    fi
+
+    log_success "Selected version: $SELECTED_VERSION"
+    INSTALL_VERSION="$SELECTED_VERSION"
+
+    # Refresh download URLs for selected version
+    if [ "$SELECTED_VERSION" != "$LATEST_VERSION" ]; then
+        local RELEASES_JSON=""
+        if [ "$DOWNLOADER" = "curl" ]; then
+            RELEASES_JSON=$(curl -sL "$GITHUB_API" 2>/dev/null)
+        else
+            RELEASES_JSON=$(wget -qO- "$GITHUB_API" 2>/dev/null)
+        fi
+
+        DOWNLOAD_URLS=$(echo "$RELEASES_JSON" | python3 -c "
+import sys, json
+try:
+    releases = json.load(sys.stdin)
+    if isinstance(releases, list):
+        for r in releases:
+            if r.get('tag_name', '') == '$SELECTED_VERSION':
+                for a in r.get('assets', []):
+                    name = a.get('name', '')
+                    url = a.get('browser_download_url', '')
+                    size = a.get('size', 0)
+                    size_mb = round(size / 1024 / 1024, 1)
+                    print(f'{name}|{url}|{size_mb}')
+                break
+except: pass
+" 2>/dev/null)
+    fi
+}
+
+# ==========================================
+# DOWNLOAD BINARY
+# ==========================================
+
+download_binary() {
+    log_step "Downloading Orion GUI $INSTALL_VERSION"
+
+    mkdir -p "$INSTALL_DIR"
+
+    if [ -z "$DOWNLOAD_URLS" ]; then
+        log_error "No download URLs found for $INSTALL_VERSION"
+        exit 1
+    fi
+
+    # Show available files
+    echo -e "${WHITE}Available downloads:${NC}"
+    local FILE_ARRAY=()
+    local URL_ARRAY=()
+    local SIZE_ARRAY=()
+    local COUNT=0
+
+    while IFS='|' read -r filename url size; do
+        COUNT=$((COUNT + 1))
+        FILE_ARRAY+=("$filename")
+        URL_ARRAY+=("$url")
+        SIZE_ARRAY+=("$size")
+
+        local ICON="📦"
+        if echo "$filename" | grep -qi "appimage"; then
+            ICON="📦"
+        elif echo "$filename" | grep -qi "tar.gz"; then
+            ICON="📁"
+        elif echo "$filename" | grep -qi "install.sh"; then
+            ICON="📜"
+        elif echo "$filename" | grep -qi "windows\|\.exe"; then
+            ICON="🪟"
+        elif echo "$filename" | grep -qi "macos\|darwin"; then
+            ICON="🍎"
+        fi
+
+        # Only show Linux files
+        if echo "$filename" | grep -qi "linux\|appimage\|install.sh"; then
+            echo -e "  ${CYAN}$COUNT)${NC} $ICON $filename  (${size} MB)"
+        fi
+    done <<< "$DOWNLOAD_URLS"
+    echo ""
+
+    # Find best file for this architecture
+    local DOWNLOAD_URL=""
+    local DOWNLOAD_FILE=""
+
+    # Priority: AppImage > tar.gz portable
+    for priority in "AppImage" "Linux.*tar.gz" "linux.*tar.gz"; do
+        while IFS='|' read -r filename url size; do
+            if echo "$filename" | grep -qi "$priority"; then
+                DOWNLOAD_URL="$url"
+                DOWNLOAD_FILE="$filename"
+                break 2
+            fi
+        done <<< "$DOWNLOAD_URLS"
+    done
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        # Let user choose
+        log_warn "Could not auto-detect Linux binary."
+        echo -e "${WHITE}All available files:${NC}"
+        COUNT=0
+        while IFS='|' read -r filename url size; do
+            COUNT=$((COUNT + 1))
+            echo -e "  ${CYAN}$COUNT)${NC} $filename  (${size} MB)"
+        done <<< "$DOWNLOAD_URLS"
+        echo ""
+
+        local FILE_NUM
+        safe_read "Choose file number: " FILE_NUM "1"
+
+        local IDX=$((FILE_NUM - 1))
+        if [ $IDX -ge 0 ] && [ $IDX -lt ${#URL_ARRAY[@]} ]; then
+            DOWNLOAD_URL="${URL_ARRAY[$IDX]}"
+            DOWNLOAD_FILE="${FILE_ARRAY[$IDX]}"
+        else
+            log_error "Invalid choice"
+            exit 1
+        fi
+    fi
+
+    log_info "Downloading: $DOWNLOAD_FILE"
+    log_info "URL: $DOWNLOAD_URL"
+
+    local DOWNLOAD_PATH="$INSTALL_DIR/$DOWNLOAD_FILE"
+
+    # Download with progress
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -L --progress-bar "$DOWNLOAD_URL" -o "$DOWNLOAD_PATH"
+    else
+        wget --show-progress -q "$DOWNLOAD_URL" -O "$DOWNLOAD_PATH"
+    fi
+
+    if [ ! -f "$DOWNLOAD_PATH" ] || [ ! -s "$DOWNLOAD_PATH" ]; then
+        log_error "Download failed!"
+        exit 1
+    fi
+
+    local FILE_SIZE=$(du -sh "$DOWNLOAD_PATH" | cut -f1)
+    log_success "Downloaded: $DOWNLOAD_FILE ($FILE_SIZE)"
+
+    # Extract or prepare binary
+    BINARY_PATH=""
+
+    if echo "$DOWNLOAD_FILE" | grep -qi "\.tar\.gz$"; then
+        log_info "Extracting archive..."
+        tar -xzf "$DOWNLOAD_PATH" -C "$INSTALL_DIR"
+        rm -f "$DOWNLOAD_PATH"
+
+        # Find the binary
+        BINARY_PATH=$(find "$INSTALL_DIR" -name "${APP_NAME}*" -type f -executable 2>/dev/null | head -1)
+
+        if [ -z "$BINARY_PATH" ]; then
+            BINARY_PATH=$(find "$INSTALL_DIR" -name "${APP_NAME}*" -type f 2>/dev/null | head -1)
+        fi
+
+        if [ -n "$BINARY_PATH" ]; then
+            chmod +x "$BINARY_PATH"
+            log_success "Extracted: $BINARY_PATH"
+        else
+            log_error "Could not find binary after extraction"
+            log_info "Contents of $INSTALL_DIR:"
+            find "$INSTALL_DIR" -type f | head -20
+            exit 1
+        fi
+
+    elif echo "$DOWNLOAD_FILE" | grep -qi "\.appimage$"; then
+        chmod +x "$DOWNLOAD_PATH"
+        BINARY_PATH="$DOWNLOAD_PATH"
+        log_success "AppImage ready: $BINARY_PATH"
+
+    else
+        chmod +x "$DOWNLOAD_PATH"
+        BINARY_PATH="$DOWNLOAD_PATH"
+        log_success "Binary ready: $BINARY_PATH"
+    fi
+
+    # Save binary path
+    echo "$BINARY_PATH" > "$INSTALL_DIR/.binary_path"
 }
 
 # ==========================================
@@ -216,17 +442,19 @@ check_ollama() {
     log_step "Checking Ollama"
 
     if command -v ollama &>/dev/null; then
-        OLLAMA_VERSION=$(ollama --version 2>&1 || echo "unknown")
-        log_success "Ollama installed: $OLLAMA_VERSION"
+        log_success "Ollama: $(ollama --version 2>&1 || echo 'installed')"
     else
-        log_warn "Ollama is not installed"
+        log_warn "Ollama not installed"
         local INSTALL_OLLAMA
-        safe_read "Install Ollama now? (y/n): " INSTALL_OLLAMA "y"
-
+        safe_read "Install Ollama? (y/n): " INSTALL_OLLAMA "y"
         if [[ "$INSTALL_OLLAMA" =~ ^[Yy]$ ]]; then
-            install_ollama
-        else
-            log_warn "Skipping. Install later: curl -fsSL https://ollama.com/install.sh | sh"
+            log_info "Installing Ollama..."
+            curl -fsSL https://ollama.com/install.sh | sh
+            if command -v ollama &>/dev/null; then
+                log_success "Ollama installed!"
+            else
+                log_error "Failed. Try: curl -fsSL https://ollama.com/install.sh | sh"
+            fi
         fi
     fi
 
@@ -234,43 +462,25 @@ check_ollama() {
         if curl -s http://localhost:11434/api/tags &>/dev/null; then
             log_success "Ollama server running"
         else
-            log_warn "Ollama server not running"
             local START_OLLAMA
-            safe_read "Start Ollama server? (y/n): " START_OLLAMA "y"
+            safe_read "Start Ollama? (y/n): " START_OLLAMA "y"
             if [[ "$START_OLLAMA" =~ ^[Yy]$ ]]; then
-                start_ollama
+                log_info "Starting Ollama..."
+                if systemctl list-unit-files 2>/dev/null | grep -q ollama; then
+                    sudo systemctl start ollama 2>/dev/null || true
+                    sleep 3
+                fi
+                if ! curl -s http://localhost:11434/api/tags &>/dev/null; then
+                    nohup ollama serve > /dev/null 2>&1 &
+                    sleep 5
+                fi
+                if curl -s http://localhost:11434/api/tags &>/dev/null; then
+                    log_success "Ollama started"
+                else
+                    log_warn "Could not verify. Try: ollama serve"
+                fi
             fi
         fi
-    fi
-}
-
-install_ollama() {
-    log_info "Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
-    if command -v ollama &>/dev/null; then
-        log_success "Ollama installed!"
-    else
-        log_error "Failed. Try: curl -fsSL https://ollama.com/install.sh | sh"
-    fi
-}
-
-start_ollama() {
-    log_info "Starting Ollama..."
-    if systemctl list-unit-files 2>/dev/null | grep -q ollama; then
-        sudo systemctl start ollama 2>/dev/null || true
-        sudo systemctl enable ollama 2>/dev/null || true
-        sleep 3
-    fi
-
-    if ! curl -s http://localhost:11434/api/tags &>/dev/null; then
-        nohup ollama serve > /dev/null 2>&1 &
-        sleep 5
-    fi
-
-    if curl -s http://localhost:11434/api/tags &>/dev/null; then
-        log_success "Ollama server started"
-    else
-        log_warn "Could not verify. Try: ollama serve"
     fi
 }
 
@@ -294,12 +504,11 @@ pull_orion_model() {
     if [ "$IS_PIPED" = true ]; then
         log_info "Pulling OmniNode/Orion:V1.1..."
         ollama pull OmniNode/Orion:V1.1
-        log_success "Orion V1.1 downloaded!"
         return
     fi
 
     echo ""
-    echo -e "${WHITE}Available versions:${NC}"
+    echo -e "${WHITE}Available:${NC}"
     echo "  1) OmniNode/Orion:V1.1 (latest)"
     echo "  2) OmniNode/Orion:V1.0"
     echo "  3) Skip"
@@ -311,461 +520,44 @@ pull_orion_model() {
     case $MODEL_CHOICE in
         1) ollama pull OmniNode/Orion:V1.1 && log_success "V1.1 downloaded!" ;;
         2) ollama pull OmniNode/Orion:V1.0 && log_success "V1.0 downloaded!" ;;
-        *) log_info "Skipping. Pull later: ollama pull OmniNode/Orion:V1.1" ;;
+        *) log_info "Pull later: ollama pull OmniNode/Orion:V1.1" ;;
     esac
 }
 
 # ==========================================
-# VERIFY LOCAL FILES
+# INSTALL SYSTEM INTEGRATION
 # ==========================================
 
-verify_local_files() {
-    log_step "Verifying Local Files"
-
-    local MISSING=false
-
-    local REQUIRED_FILES=(
-        "app.py"
-        "templates/index.html"
-        "static/style.css"
-        "static/script.js"
-    )
-
-    for f in "${REQUIRED_FILES[@]}"; do
-        if [ -f "$SCRIPT_DIR/$f" ]; then
-            log_success "$f"
-        else
-            log_error "$f — MISSING"
-            MISSING=true
-        fi
-    done
-
-    if [ "$MISSING" = true ]; then
-        log_error "Required files are missing!"
-        log_info "Make sure you run this script from the Orion repo directory."
-        echo ""
-        echo -e "  ${GREEN}cd /path/to/Orion${NC}"
-        echo -e "  ${GREEN}./install.sh${NC}"
-        echo ""
-        exit 1
-    fi
-
-    log_success "All required files found"
-}
-
-# ==========================================
-# BUILD APPIMAGE LOCALLY
-# ==========================================
-
-build_appimage() {
-    log_step "Building AppImage"
-
-    local BUILD_DIR="$INSTALL_DIR/build"
-    local APPDIR="$BUILD_DIR/AppDir"
-
-    # Clean previous build
-    rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR"
-    mkdir -p "$APPDIR/usr/bin"
-    mkdir -p "$APPDIR/usr/share/applications"
-    mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
-    mkdir -p "$APPDIR/usr/lib"
-
-    # ==========================================
-    # Step 1: Create virtual environment for build
-    # ==========================================
-    log_info "Creating build environment..."
-
-    local BUILD_VENV="$BUILD_DIR/buildvenv"
-    $PYTHON_CMD -m venv "$BUILD_VENV"
-
-    "$BUILD_VENV/bin/pip" install --upgrade pip -q 2>/dev/null
-    "$BUILD_VENV/bin/pip" install pyinstaller -q 2>/dev/null
-
-    if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
-        "$BUILD_VENV/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" -q 2>/dev/null
-    else
-        "$BUILD_VENV/bin/pip" install flask requests pyyaml -q 2>/dev/null
-    fi
-
-    log_success "Build environment ready"
-
-    # ==========================================
-    # Step 2: Build binary with PyInstaller
-    # ==========================================
-    log_info "Building binary with PyInstaller..."
-    log_info "This may take a few minutes..."
-
-    cd "$SCRIPT_DIR"
-
-    # Create config.yml if missing
-    if [ ! -f "$SCRIPT_DIR/config.yml" ]; then
-        create_config_file "$SCRIPT_DIR/config.yml"
-    fi
-
-    # Create install_ollama.py if missing
-    if [ ! -f "$SCRIPT_DIR/install_ollama.py" ]; then
-        create_install_ollama "$SCRIPT_DIR/install_ollama.py"
-    fi
-
-    "$BUILD_VENV/bin/pyinstaller" \
-        --onefile \
-        --name "$APP_NAME" \
-        --add-data "templates:templates" \
-        --add-data "static:static" \
-        --add-data "config.yml:." \
-        --add-data "install_ollama.py:." \
-        --hidden-import flask \
-        --hidden-import requests \
-        --hidden-import yaml \
-        --hidden-import jinja2 \
-        --hidden-import markupsafe \
-        --hidden-import click \
-        --hidden-import blinker \
-        --hidden-import itsdangerous \
-        --hidden-import werkzeug \
-        --clean \
-        --noconfirm \
-        --distpath "$BUILD_DIR/dist" \
-        --workpath "$BUILD_DIR/work" \
-        --specpath "$BUILD_DIR" \
-        app.py 2>&1 | while IFS= read -r line; do
-            # Show progress dots
-            if echo "$line" | grep -q "INFO"; then
-                echo -n "."
-            fi
-        done
-
-    echo ""
-
-    if [ ! -f "$BUILD_DIR/dist/$APP_NAME" ]; then
-        log_error "PyInstaller build failed!"
-        log_info "Check if all dependencies are installed."
-        exit 1
-    fi
-
-    log_success "Binary built: $BUILD_DIR/dist/$APP_NAME"
-
-    # Strip binary to reduce size
-    if command -v strip &>/dev/null; then
-        strip "$BUILD_DIR/dist/$APP_NAME" 2>/dev/null || true
-        log_info "Binary stripped"
-    fi
-
-    local BINARY_SIZE=$(du -sh "$BUILD_DIR/dist/$APP_NAME" | cut -f1)
-    log_info "Binary size: $BINARY_SIZE"
-
-    # ==========================================
-    # Step 3: Create AppDir structure
-    # ==========================================
-    log_info "Creating AppImage structure..."
-
-    # Copy binary
-    cp "$BUILD_DIR/dist/$APP_NAME" "$APPDIR/usr/bin/"
-    chmod +x "$APPDIR/usr/bin/$APP_NAME"
-
-    # Copy config files into binary directory
-    cp "$SCRIPT_DIR/config.yml" "$APPDIR/usr/bin/" 2>/dev/null || true
-    cp "$SCRIPT_DIR/install_ollama.py" "$APPDIR/usr/bin/" 2>/dev/null || true
-
-    # Create AppRun
-    cat > "$APPDIR/AppRun" << 'APPRUNEOF'
-#!/bin/bash
-SELF=$(readlink -f "$0")
-HERE=${SELF%/*}
-
-export PATH="${HERE}/usr/bin:${PATH}"
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/lib64:${LD_LIBRARY_PATH}"
-export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS}"
-
-# Auto-start Ollama if not running
-if command -v ollama &>/dev/null; then
-    if ! curl -s http://localhost:11434/api/tags &>/dev/null 2>&1; then
-        nohup ollama serve > /dev/null 2>&1 &
-        sleep 2
-    fi
-fi
-
-# Open browser
-if command -v xdg-open &>/dev/null; then
-    (sleep 2 && xdg-open "http://localhost:5000") &
-fi
-
-exec "${HERE}/usr/bin/OrionGUI" "$@"
-APPRUNEOF
-    chmod +x "$APPDIR/AppRun"
-
-    # Create .desktop file
-    cat > "$APPDIR/OrionGUI.desktop" << 'DESKTOPEOF'
-[Desktop Entry]
-Type=Application
-Name=Orion GUI
-Comment=GUI for Orion AI on Ollama
-Exec=OrionGUI
-Icon=orion
-Categories=Utility;Development;Science;ArtificialIntelligence;
-Terminal=false
-StartupNotify=true
-Keywords=ai;ollama;orion;chat;llm;
-DESKTOPEOF
-    cp "$APPDIR/OrionGUI.desktop" "$APPDIR/usr/share/applications/"
-
-    # Create icon
-    cat > "$APPDIR/orion.svg" << 'SVGEOF'
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <rect width="256" height="256" rx="48" fill="#0a0a0f"/>
-  <circle cx="128" cy="128" r="60" fill="none" stroke="#6c63ff" stroke-width="8"/>
-  <circle cx="128" cy="128" r="20" fill="#6c63ff"/>
-  <circle cx="128" cy="128" r="90" fill="none" stroke="#6c63ff" stroke-width="3" opacity="0.3"/>
-</svg>
-SVGEOF
-
-    # Convert SVG to PNG
-    if command -v convert &>/dev/null; then
-        convert "$APPDIR/orion.svg" -resize 256x256 "$APPDIR/orion.png" 2>/dev/null
-    elif command -v rsvg-convert &>/dev/null; then
-        rsvg-convert -w 256 -h 256 "$APPDIR/orion.svg" -o "$APPDIR/orion.png" 2>/dev/null
-    else
-        # Create a simple 1x1 PNG as fallback
-        log_warn "No SVG converter found. Using SVG icon."
-        cp "$APPDIR/orion.svg" "$APPDIR/orion.png" 2>/dev/null || true
-    fi
-
-    cp "$APPDIR/orion.png" "$APPDIR/.DirIcon" 2>/dev/null || true
-    cp "$APPDIR/orion.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/orion.png" 2>/dev/null || true
-
-    log_success "AppDir structure created"
-
-    # ==========================================
-    # Step 4: Build AppImage
-    # ==========================================
-    log_info "Packaging AppImage..."
-
-    local APPIMAGE_FILE="$APPIMAGE_DIR/${APP_NAME}-${APP_VERSION}-${ARCH}.AppImage"
-    local APPIMAGE_BUILT=false
-
-    # Method 1: Download and use appimagetool
-    log_info "Downloading appimagetool..."
-    local APPIMAGETOOL="$BUILD_DIR/appimagetool"
-
-    if [ "$ARCH" = "x86_64" ]; then
-        curl -sL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -o "$APPIMAGETOOL" 2>/dev/null
-    elif [ "$ARCH" = "aarch64" ]; then
-        curl -sL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage" -o "$APPIMAGETOOL" 2>/dev/null
-    fi
-
-    if [ -f "$APPIMAGETOOL" ]; then
-        chmod +x "$APPIMAGETOOL"
-
-        # Try --appimage-extract-and-run first
-        log_info "Building AppImage (method 1)..."
-        ARCH=$ARCH "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$APPIMAGE_FILE" 2>/dev/null && {
-            APPIMAGE_BUILT=true
-            log_success "AppImage built (appimagetool)"
-        }
-
-        # Try extracting appimagetool
-        if [ "$APPIMAGE_BUILT" = false ]; then
-            log_info "Trying method 2..."
-            cd "$BUILD_DIR"
-            "$APPIMAGETOOL" --appimage-extract > /dev/null 2>&1 || true
-            if [ -d "$BUILD_DIR/squashfs-root" ]; then
-                ARCH=$ARCH "$BUILD_DIR/squashfs-root/AppRun" "$APPDIR" "$APPIMAGE_FILE" 2>/dev/null && {
-                    APPIMAGE_BUILT=true
-                    log_success "AppImage built (extracted tool)"
-                }
-            fi
-            cd "$SCRIPT_DIR"
-        fi
-    fi
-
-    # Method 3: Manual squashfs + runtime
-    if [ "$APPIMAGE_BUILT" = false ]; then
-        log_info "Trying manual method..."
-
-        # Install squashfs-tools if needed
-        if ! command -v mksquashfs &>/dev/null; then
-            install_package "squashfs-tools" 2>/dev/null || true
-        fi
-
-        if command -v mksquashfs &>/dev/null; then
-            # Download runtime
-            local RUNTIME="$BUILD_DIR/runtime"
-            if [ "$ARCH" = "x86_64" ]; then
-                curl -sL "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64" -o "$RUNTIME" 2>/dev/null
-            elif [ "$ARCH" = "aarch64" ]; then
-                curl -sL "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-aarch64" -o "$RUNTIME" 2>/dev/null
-            fi
-
-            if [ -f "$RUNTIME" ]; then
-                log_info "Creating squashfs..."
-                mksquashfs "$APPDIR" "$BUILD_DIR/squashfs.img" \
-                    -root-owned -noappend \
-                    -comp zstd -Xcompression-level 19 2>/dev/null || \
-                mksquashfs "$APPDIR" "$BUILD_DIR/squashfs.img" \
-                    -root-owned -noappend 2>/dev/null
-
-                if [ -f "$BUILD_DIR/squashfs.img" ]; then
-                    cat "$RUNTIME" "$BUILD_DIR/squashfs.img" > "$APPIMAGE_FILE"
-                    chmod +x "$APPIMAGE_FILE"
-                    APPIMAGE_BUILT=true
-                    log_success "AppImage built (manual squashfs)"
-                fi
-            fi
-        fi
-    fi
-
-    # Method 4: Fallback — just use standalone binary
-    if [ "$APPIMAGE_BUILT" = false ]; then
-        log_warn "AppImage packaging failed. Using standalone binary instead."
-        APPIMAGE_FILE="$APPIMAGE_DIR/$APP_NAME"
-        cp "$BUILD_DIR/dist/$APP_NAME" "$APPIMAGE_FILE"
-        chmod +x "$APPIMAGE_FILE"
-        log_success "Standalone binary installed"
-    fi
-
-    # Show result
-    if [ -f "$APPIMAGE_FILE" ]; then
-        local FINAL_SIZE=$(du -sh "$APPIMAGE_FILE" | cut -f1)
-        log_success "Final size: $FINAL_SIZE"
-        log_success "Location: $APPIMAGE_FILE"
-    fi
-
-    # ==========================================
-    # Step 5: Cleanup build files
-    # ==========================================
-    log_info "Cleaning up build files..."
-    rm -rf "$BUILD_DIR/buildvenv"
-    rm -rf "$BUILD_DIR/work"
-    rm -rf "$BUILD_DIR/dist"
-    rm -rf "$BUILD_DIR/AppDir"
-    rm -rf "$BUILD_DIR/squashfs-root"
-    rm -f "$BUILD_DIR/appimagetool"
-    rm -f "$BUILD_DIR/runtime"
-    rm -f "$BUILD_DIR/squashfs.img"
-    rm -f "$BUILD_DIR"/*.spec
-    rmdir "$BUILD_DIR" 2>/dev/null || true
-
-    # Clean pyinstaller artifacts from source dir
-    rm -rf "$SCRIPT_DIR/build" 2>/dev/null || true
-    rm -rf "$SCRIPT_DIR/__pycache__" 2>/dev/null || true
-    rm -f "$SCRIPT_DIR"/*.spec 2>/dev/null || true
-
-    log_success "Cleanup done"
-
-    # Return the appimage path
-    echo "$APPIMAGE_FILE" > /tmp/orion_appimage_path
-}
-
-# ==========================================
-# CREATE HELPER FILES
-# ==========================================
-
-create_config_file() {
-    local TARGET="$1"
-    cat > "$TARGET" << 'CONFIGEOF'
-app:
-  name: Orion GUI
-  version: "1.1.0"
-  author: OmniNode
-  port: 5000
-  debug: false
-
-ollama:
-  url: http://localhost:11434
-  default_model: OmniNode/Orion:V1.1
-  auto_check_updates: true
-
-models:
-  available:
-    - name: OmniNode/Orion:V1.1
-      version: "1.1"
-      description: Latest stable
-      size: 4.1 GB
-      latest: true
-    - name: OmniNode/Orion:V1.0
-      version: "1.0"
-      description: Initial release
-      size: 4.1 GB
-      latest: false
-  recommended:
-    - name: mistral:7b
-      description: Mistral 7B
-      size: 4.1 GB
-    - name: llama3:8b
-      description: LLaMA 3 8B
-      size: 4.7 GB
-    - name: codellama:7b
-      description: Code LLaMA 7B
-      size: 3.8 GB
-
-ollama_install:
-  linux:
-    command: curl -fsSL https://ollama.com/install.sh | sh
-CONFIGEOF
-}
-
-create_install_ollama() {
-    local TARGET="$1"
-    cat > "$TARGET" << 'PYEOF'
-#!/usr/bin/env python3
-import platform, subprocess, sys, os, time
-try:
-    import urllib.request
-except: pass
-
-class OllamaInstaller:
-    def __init__(self):
-        self.system = platform.system().lower()
-    def is_installed(self):
-        try:
-            r = subprocess.run(["ollama","--version"], capture_output=True, text=True, timeout=10)
-            return r.returncode == 0
-        except: return False
-    def install(self):
-        if self.system == "linux":
-            subprocess.run(["bash","-c","curl -fsSL https://ollama.com/install.sh | sh"])
-    def start(self):
-        try:
-            subprocess.Popen(["ollama","serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            time.sleep(5)
-        except: pass
-
-if __name__ == "__main__":
-    i = OllamaInstaller()
-    if not i.is_installed(): i.install()
-    i.start()
-PYEOF
-}
-
-# ==========================================
-# INSTALL (CREATE LAUNCHER, DESKTOP, ETC)
-# ==========================================
-
-install_system_integration() {
-    log_step "System Integration"
+install_integration() {
+    log_step "Installing System Integration"
 
     mkdir -p "$BIN_DIR"
     mkdir -p "$DESKTOP_DIR"
     mkdir -p "$ICON_DIR"
 
-    # Get AppImage path
-    local APPIMAGE_FILE=""
-    if [ -f /tmp/orion_appimage_path ]; then
-        APPIMAGE_FILE=$(cat /tmp/orion_appimage_path)
-        rm -f /tmp/orion_appimage_path
-    else
-        APPIMAGE_FILE="$APPIMAGE_DIR/$APP_NAME"
+    # Get binary path
+    local BINARY_PATH=""
+    if [ -f "$INSTALL_DIR/.binary_path" ]; then
+        BINARY_PATH=$(cat "$INSTALL_DIR/.binary_path")
+    fi
+
+    if [ -z "$BINARY_PATH" ] || [ ! -f "$BINARY_PATH" ]; then
+        BINARY_PATH=$(find "$INSTALL_DIR" -name "${APP_NAME}*" -type f -executable 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$BINARY_PATH" ]; then
+        log_error "Binary not found in $INSTALL_DIR"
+        exit 1
     fi
 
     # ==========================================
-    # Launcher script
+    # Launcher
     # ==========================================
     cat > "$BIN_DIR/orion-gui" << LAUNCHEREOF
 #!/bin/bash
 # Orion GUI Launcher
 
-APPIMAGE="$APPIMAGE_FILE"
+BINARY="$BINARY_PATH"
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -774,7 +566,7 @@ NC='\033[0m'
 
 echo -e "\${PURPLE}◉ Orion GUI\${NC}"
 
-# Start Ollama if needed
+# Start Ollama
 if command -v ollama &>/dev/null; then
     if ! curl -s http://localhost:11434/api/tags &>/dev/null 2>&1; then
         echo -e "\${CYAN}Starting Ollama...\${NC}"
@@ -793,7 +585,8 @@ if command -v ollama &>/dev/null; then
         echo -e "\${GREEN}✅ Ollama running\${NC}"
     fi
 else
-    echo "⚠️ Ollama not installed. Install: curl -fsSL https://ollama.com/install.sh | sh"
+    echo "⚠️ Ollama not installed"
+    echo "   Install: curl -fsSL https://ollama.com/install.sh | sh"
 fi
 
 # Open browser
@@ -805,14 +598,7 @@ echo -e "\${CYAN}🌐 http://localhost:5000\${NC}"
 echo "Press Ctrl+C to stop"
 echo ""
 
-# Run AppImage or binary
-if [ -f "\$APPIMAGE" ]; then
-    exec "\$APPIMAGE" "\$@"
-else
-    echo "❌ Binary not found: \$APPIMAGE"
-    echo "Reinstall: ./install.sh --install"
-    exit 1
-fi
+exec "\$BINARY" "\$@"
 LAUNCHEREOF
 
     chmod +x "$BIN_DIR/orion-gui"
@@ -875,15 +661,12 @@ if [[ ! "\$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# Stop service
 systemctl --user stop orion-gui 2>/dev/null || true
 systemctl --user disable orion-gui 2>/dev/null || true
-rm -f "$HOME/.config/systemd/user/orion-gui.service" 2>/dev/null
+rm -f "$HOME/.config/systemd/user/orion-gui.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
-# Remove files
 rm -rf "$INSTALL_DIR"
-rm -rf "$APPIMAGE_DIR"
 rm -f "$BIN_DIR/orion-gui"
 rm -f "$BIN_DIR/orion-gui-uninstall"
 rm -f "$DESKTOP_DIR/orion-gui.desktop"
@@ -893,7 +676,6 @@ rm -f "$ICON_DIR/orion-gui.png"
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
-echo ""
 echo "✅ Orion GUI uninstalled!"
 echo "Ollama and models were NOT removed."
 UNINSTALLEOF
@@ -914,7 +696,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$APPIMAGE_FILE
+ExecStart=$BINARY_PATH
 Restart=on-failure
 RestartSec=5
 
@@ -963,19 +745,14 @@ add_to_path() {
 # ==========================================
 
 print_summary() {
-    local APPIMAGE_FILE=""
-    if [ -f /tmp/orion_appimage_path ]; then
-        APPIMAGE_FILE=$(cat /tmp/orion_appimage_path)
-    else
-        APPIMAGE_FILE="$APPIMAGE_DIR/${APP_NAME}-${APP_VERSION}-${ARCH}.AppImage"
-        if [ ! -f "$APPIMAGE_FILE" ]; then
-            APPIMAGE_FILE="$APPIMAGE_DIR/$APP_NAME"
-        fi
+    local BINARY_PATH=""
+    if [ -f "$INSTALL_DIR/.binary_path" ]; then
+        BINARY_PATH=$(cat "$INSTALL_DIR/.binary_path")
     fi
 
     local FINAL_SIZE=""
-    if [ -f "$APPIMAGE_FILE" ]; then
-        FINAL_SIZE=$(du -sh "$APPIMAGE_FILE" | cut -f1)
+    if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
+        FINAL_SIZE=$(du -sh "$BINARY_PATH" | cut -f1)
     fi
 
     echo ""
@@ -985,11 +762,13 @@ print_summary() {
     echo "╚══════════════════════════════════════════╝"
     echo -e "${NC}"
     echo ""
-    echo -e "${WHITE}📦 AppImage:${NC}    $APPIMAGE_FILE"
+    echo -e "${WHITE}📦 Version:${NC}     $INSTALL_VERSION"
     [ -n "$FINAL_SIZE" ] && echo -e "${WHITE}📏 Size:${NC}        $FINAL_SIZE"
+    echo -e "${WHITE}📁 Location:${NC}    $INSTALL_DIR"
     echo -e "${WHITE}🚀 Launch:${NC}      orion-gui"
     echo -e "${WHITE}🌐 URL:${NC}         http://localhost:5000"
     echo -e "${WHITE}🗑  Uninstall:${NC}   orion-gui-uninstall"
+    echo -e "${WHITE}🔄 Update:${NC}      orion-gui-update"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
@@ -1001,7 +780,14 @@ print_summary() {
     echo -e "  ${GREEN}systemctl --user start orion-gui${NC}   Start now"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
+
+    # Reload shell hint
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+        echo ""
+        echo -e "${YELLOW}⚠️  Run this to use orion-gui now:${NC}"
+        echo -e "  ${GREEN}source ~/.bashrc${NC}  (or restart terminal)"
+        echo ""
+    fi
 }
 
 # ==========================================
@@ -1010,11 +796,11 @@ print_summary() {
 
 full_install() {
     check_system
-    check_dependencies
     check_ollama
-    verify_local_files
-    build_appimage
-    install_system_integration
+    fetch_releases
+    select_version "$1"
+    download_binary
+    install_integration
     add_to_path
     pull_orion_model
     print_summary
@@ -1037,12 +823,34 @@ full_install() {
 update_install() {
     log_step "Updating Orion GUI"
 
-    verify_local_files
-    check_dependencies
-    build_appimage
-    install_system_integration
+    check_system
+    fetch_releases
 
-    log_success "Orion GUI updated!"
+    # Check current version
+    local CURRENT=""
+    if [ -f "$INSTALL_DIR/.version" ]; then
+        CURRENT=$(cat "$INSTALL_DIR/.version")
+    fi
+
+    if [ "$CURRENT" = "$LATEST_VERSION" ]; then
+        log_success "Already on latest: $LATEST_VERSION"
+        local FORCE
+        safe_read "Reinstall anyway? (y/n): " FORCE "n"
+        if [[ ! "$FORCE" =~ ^[Yy]$ ]]; then
+            return
+        fi
+    else
+        log_info "Current: ${CURRENT:-unknown} → Latest: $LATEST_VERSION"
+    fi
+
+    select_version
+    download_binary
+    install_integration
+
+    # Save version
+    echo "$INSTALL_VERSION" > "$INSTALL_DIR/.version"
+
+    log_success "Updated to $INSTALL_VERSION!"
 }
 
 # ==========================================
@@ -1052,11 +860,36 @@ update_install() {
 check_status() {
     log_step "System Status"
 
-    # Python
-    if command -v python3 &>/dev/null; then
-        log_success "Python: $(python3 --version)"
+    # Version
+    if [ -f "$INSTALL_DIR/.version" ]; then
+        log_success "Version: $(cat "$INSTALL_DIR/.version")"
+    fi
+
+    # Binary
+    if [ -f "$INSTALL_DIR/.binary_path" ]; then
+        local BP=$(cat "$INSTALL_DIR/.binary_path")
+        if [ -f "$BP" ]; then
+            local SIZE=$(du -sh "$BP" | cut -f1)
+            log_success "Binary: $BP ($SIZE)"
+        else
+            log_error "Binary missing: $BP"
+        fi
     else
-        log_error "Python: not found"
+        log_error "Not installed"
+    fi
+
+    # Launcher
+    if [ -f "$BIN_DIR/orion-gui" ]; then
+        log_success "Launcher: $BIN_DIR/orion-gui"
+    else
+        log_error "Launcher: not found"
+    fi
+
+    # Desktop
+    if [ -f "$DESKTOP_DIR/orion-gui.desktop" ]; then
+        log_success "Desktop entry: found"
+    else
+        log_warn "Desktop entry: not found"
     fi
 
     # Ollama
@@ -1072,34 +905,6 @@ check_status() {
         log_success "Ollama server: running ($MODELS models)"
     else
         log_error "Ollama server: not running"
-    fi
-
-    # AppImage
-    local FOUND_APPIMAGE=false
-    for f in "$APPIMAGE_DIR/$APP_NAME"*.AppImage "$APPIMAGE_DIR/$APP_NAME"; do
-        if [ -f "$f" ]; then
-            local SIZE=$(du -sh "$f" | cut -f1)
-            log_success "AppImage: $f ($SIZE)"
-            FOUND_APPIMAGE=true
-            break
-        fi
-    done
-    if [ "$FOUND_APPIMAGE" = false ]; then
-        log_error "AppImage: not found"
-    fi
-
-    # Launcher
-    if [ -f "$BIN_DIR/orion-gui" ]; then
-        log_success "Launcher: $BIN_DIR/orion-gui"
-    else
-        log_error "Launcher: not found"
-    fi
-
-    # Desktop entry
-    if [ -f "$DESKTOP_DIR/orion-gui.desktop" ]; then
-        log_success "Desktop entry: found"
-    else
-        log_warn "Desktop entry: not found"
     fi
 
     # Orion model
@@ -1120,7 +925,7 @@ uninstall() {
     if [ -f "$BIN_DIR/orion-gui-uninstall" ]; then
         exec "$BIN_DIR/orion-gui-uninstall"
     else
-        log_error "Uninstaller not found."
+        log_error "Uninstaller not found"
         log_info "Manual: rm -rf $INSTALL_DIR && rm -f $BIN_DIR/orion-gui"
     fi
 }
@@ -1133,39 +938,33 @@ show_menu() {
     print_banner
 
     if [ "$IS_PIPED" = true ]; then
-        log_error "Cannot install via pipe. Local files are required."
-        echo ""
-        echo -e "  ${GREEN}git clone https://github.com/OmniNodeCo/Orion.git${NC}"
-        echo -e "  ${GREEN}cd Orion${NC}"
-        echo -e "  ${GREEN}./install.sh${NC}"
-        echo ""
-        exit 1
+        log_info "Pipe mode → auto installing latest"
+        full_install
+        return
     fi
 
     echo -e "${WHITE}Choose an option:${NC}"
     echo ""
-    echo "  1) 🚀 Full Install (build AppImage + install)"
+    echo "  1) 🚀 Full Install (download + install)"
     echo "  2) 📦 Install Ollama only"
-    echo "  3) 🔨 Build AppImage only"
+    echo "  3) 🔄 Update to latest version"
     echo "  4) 📥 Pull Orion model only"
-    echo "  5) 🔄 Update (rebuild + reinstall)"
-    echo "  6) 🗑  Uninstall"
-    echo "  7) 🔍 Check status"
-    echo "  8) ❌ Exit"
+    echo "  5) 🗑  Uninstall"
+    echo "  6) 🔍 Check status"
+    echo "  7) ❌ Exit"
     echo ""
 
     local MENU_CHOICE
-    read -p "Choice (1-8): " MENU_CHOICE </dev/tty
+    read -p "Choice (1-7): " MENU_CHOICE </dev/tty
 
     case $MENU_CHOICE in
         1) full_install ;;
-        2) check_system && install_ollama && start_ollama ;;
-        3) check_system && check_dependencies && verify_local_files && build_appimage && log_success "AppImage built!" ;;
+        2) check_system && check_ollama ;;
+        3) update_install ;;
         4) pull_orion_model ;;
-        5) update_install ;;
-        6) uninstall ;;
-        7) check_status ;;
-        8) echo "Goodbye! 👋" && exit 0 ;;
+        5) uninstall ;;
+        6) check_status ;;
+        7) echo "Goodbye! 👋" && exit 0 ;;
         *) log_error "Invalid choice" && show_menu ;;
     esac
 }
@@ -1175,33 +974,40 @@ show_menu() {
 # ==========================================
 
 case "${1:-}" in
-    --install|-i)   full_install ;;
-    --build|-b)     check_system && check_dependencies && verify_local_files && build_appimage ;;
+    --install|-i)   full_install "$2" ;;
     --update|-u)    update_install ;;
     --uninstall|-r) uninstall ;;
     --status|-s)    check_status ;;
-    --ollama)       check_system && install_ollama && start_ollama ;;
+    --ollama)       check_system && check_ollama ;;
     --pull)         pull_orion_model ;;
+    --version|-v)
+        if [ -f "$INSTALL_DIR/.version" ]; then
+            echo "Orion GUI $(cat "$INSTALL_DIR/.version")"
+        else
+            echo "Not installed"
+        fi
+        ;;
     --help|-h)
         echo ""
-        echo "◉ Orion GUI Local Installer"
+        echo "◉ Orion GUI Installer"
         echo ""
-        echo "Usage: ./install.sh [option]"
+        echo "Usage: ./install.sh [option] [version]"
         echo ""
         echo "Options:"
-        echo "  --install, -i    Full install (build AppImage locally)"
-        echo "  --build, -b      Build AppImage only"
-        echo "  --update, -u     Rebuild and update"
-        echo "  --uninstall, -r  Remove Orion GUI"
-        echo "  --status, -s     Check system status"
-        echo "  --ollama         Install Ollama only"
-        echo "  --pull           Pull Orion model"
-        echo "  --help, -h       Show this help"
+        echo "  --install, -i [ver]  Install (latest or specific version)"
+        echo "  --update, -u         Update to latest"
+        echo "  --uninstall, -r      Remove"
+        echo "  --status, -s         Check status"
+        echo "  --version, -v        Show installed version"
+        echo "  --ollama             Install Ollama"
+        echo "  --pull               Pull Orion model"
+        echo "  --help, -h           Show help"
         echo ""
-        echo "Run from repo directory:"
-        echo "  git clone https://github.com/OmniNodeCo/Orion.git"
-        echo "  cd Orion"
-        echo "  ./install.sh"
+        echo "Examples:"
+        echo "  ./install.sh                    Interactive menu"
+        echo "  ./install.sh --install          Install latest"
+        echo "  ./install.sh --install v1.0.0   Install specific version"
+        echo "  curl ... | bash                 Auto install latest"
         echo ""
         ;;
     *)
