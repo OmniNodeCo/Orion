@@ -27,6 +27,11 @@ BIN_DIR="$HOME/.local/bin"
 DESKTOP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
 ARCH=$(uname -m)
+INSTALL_VERSION=""
+DOWNLOAD_URLS=""
+LATEST_VERSION=""
+AVAILABLE_VERSIONS=""
+DOWNLOADER=""
 
 # Detect pipe
 IS_PIPED=false
@@ -97,7 +102,7 @@ check_system() {
         log_success "Distro: $NAME $VERSION_ID"
     fi
 
-    # Check curl or wget
+    # Check downloader
     if command -v curl &>/dev/null; then
         DOWNLOADER="curl"
         log_success "Downloader: curl"
@@ -110,6 +115,31 @@ check_system() {
         exit 1
     fi
 
+    # Check python3 (needed for JSON parsing)
+    if ! command -v python3 &>/dev/null; then
+        log_warn "python3 not found. Installing..."
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get update -qq 2>/dev/null
+            sudo apt-get install -y -qq python3 2>/dev/null
+        elif command -v dnf &>/dev/null; then
+            sudo dnf install -y -q python3 2>/dev/null
+        elif command -v pacman &>/dev/null; then
+            sudo pacman -S --noconfirm python 2>/dev/null
+        elif command -v zypper &>/dev/null; then
+            sudo zypper install -y python3 2>/dev/null
+        elif command -v apk &>/dev/null; then
+            sudo apk add python3 2>/dev/null
+        fi
+    fi
+
+    if command -v python3 &>/dev/null; then
+        log_success "Python: $(python3 --version 2>&1)"
+    else
+        log_error "python3 required for JSON parsing"
+        exit 1
+    fi
+
+    # Root check
     if [ "$EUID" -eq 0 ]; then
         log_warn "Running as root. Installing system-wide."
         INSTALL_DIR="/opt/OrionGUI"
@@ -135,64 +165,87 @@ fetch_releases() {
         RELEASES_JSON=$(wget -qO- "$GITHUB_API" 2>/dev/null)
     fi
 
-    if [ -z "$RELEASES_JSON" ] || echo "$RELEASES_JSON" | grep -q "API rate limit"; then
+    if [ -z "$RELEASES_JSON" ]; then
         log_error "Could not fetch releases from GitHub"
         log_info "Check: https://github.com/$GITHUB_REPO/releases"
         exit 1
     fi
 
-    # Parse releases using python (available on most Linux)
-    if command -v python3 &>/dev/null; then
-        AVAILABLE_VERSIONS=$(echo "$RELEASES_JSON" | python3 -c "
+    # Check for API errors
+    if echo "$RELEASES_JSON" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, dict) and 'message' in data:
+        print(data['message'])
+        sys.exit(1)
+except SystemExit:
+    sys.exit(1)
+except:
+    pass
+" 2>/dev/null; then
+        : # OK
+    else
+        local ERR_MSG=$(echo "$RELEASES_JSON" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, dict):
+        print(data.get('message', 'Unknown error'))
+except: print('Parse error')
+" 2>/dev/null)
+        log_error "GitHub API error: $ERR_MSG"
+        exit 1
+    fi
+
+    # Parse releases
+    AVAILABLE_VERSIONS=$(echo "$RELEASES_JSON" | python3 -c "
 import sys, json
 try:
     releases = json.load(sys.stdin)
     if isinstance(releases, list):
         for r in releases[:10]:
             tag = r.get('tag_name', '')
-            name = r.get('name', '')
+            name = r.get('name', tag)
             pre = r.get('prerelease', False)
+            draft = r.get('draft', False)
             date = r.get('published_at', '')[:10]
             assets = len(r.get('assets', []))
-            marker = ' (pre-release)' if pre else ''
-            print(f'{tag}|{name}|{date}|{assets}{marker}')
-except: pass
+            marker = ''
+            if pre: marker = ' [pre-release]'
+            if draft: marker = ' [draft]'
+            if not draft:
+                print(f'{tag}|{name}|{date}|{assets}|{marker}')
+except Exception as e:
+    pass
 " 2>/dev/null)
 
-        LATEST_VERSION=$(echo "$RELEASES_JSON" | python3 -c "
+    # Get latest version (stable first, then pre-release)
+    LATEST_VERSION=$(echo "$RELEASES_JSON" | python3 -c "
 import sys, json
 try:
     releases = json.load(sys.stdin)
     if isinstance(releases, list):
+        # Try stable first
+        stable = None
+        prerelease = None
         for r in releases:
-            if not r.get('prerelease', False):
-                print(r.get('tag_name', ''))
-                break
-except: pass
-" 2>/dev/null)
+            if r.get('draft', False):
+                continue
+            if not r.get('prerelease', False) and stable is None:
+                stable = r.get('tag_name', '')
+            if r.get('prerelease', False) and prerelease is None:
+                prerelease = r.get('tag_name', '')
 
-        # Get download URLs for latest
-        DOWNLOAD_URLS=$(echo "$RELEASES_JSON" | python3 -c "
-import sys, json
-try:
-    releases = json.load(sys.stdin)
-    if isinstance(releases, list):
-        for r in releases:
-            if r.get('tag_name', '') == '$LATEST_VERSION' or not r.get('prerelease', False):
-                for a in r.get('assets', []):
-                    name = a.get('name', '')
-                    url = a.get('browser_download_url', '')
-                    size = a.get('size', 0)
-                    size_mb = round(size / 1024 / 1024, 1)
-                    print(f'{name}|{url}|{size_mb}')
-                break
-except: pass
+        if stable:
+            print(stable)
+        elif prerelease:
+            print(prerelease)
+        elif releases:
+            print(releases[0].get('tag_name', ''))
+except:
+    pass
 " 2>/dev/null)
-    else
-        # Fallback: use grep
-        LATEST_VERSION=$(echo "$RELEASES_JSON" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)
-        DOWNLOAD_URLS=""
-    fi
 
     if [ -z "$LATEST_VERSION" ]; then
         log_error "No releases found"
@@ -200,82 +253,63 @@ except: pass
         exit 1
     fi
 
-    log_success "Latest version: $LATEST_VERSION"
+    # Check if latest is pre-release
+    local IS_PRERELEASE=$(echo "$RELEASES_JSON" | python3 -c "
+import sys, json
+try:
+    releases = json.load(sys.stdin)
+    if isinstance(releases, list):
+        for r in releases:
+            if r.get('tag_name', '') == '$LATEST_VERSION':
+                print('true' if r.get('prerelease', False) else 'false')
+                break
+except: pass
+" 2>/dev/null)
 
+    if [ "$IS_PRERELEASE" = "true" ]; then
+        log_success "Latest version: $LATEST_VERSION (pre-release)"
+    else
+        log_success "Latest version: $LATEST_VERSION"
+    fi
+
+    # Show versions
     if [ -n "$AVAILABLE_VERSIONS" ]; then
         echo ""
         echo -e "${WHITE}Available versions:${NC}"
         local COUNT=0
-        while IFS='|' read -r tag name date assets extra; do
+        while IFS='|' read -r tag name date assets marker; do
             COUNT=$((COUNT + 1))
-            echo -e "  ${CYAN}$COUNT)${NC} $tag  ($date, $assets files) $extra"
+            if [ "$tag" = "$LATEST_VERSION" ]; then
+                echo -e "  ${GREEN}$COUNT) $tag${NC}  ($date, $assets files)${YELLOW}$marker${NC} ← latest"
+            else
+                echo -e "  ${CYAN}$COUNT)${NC} $tag  ($date, $assets files)${YELLOW}$marker${NC}"
+            fi
         done <<< "$AVAILABLE_VERSIONS"
         echo ""
     fi
 }
 
 # ==========================================
-# SELECT VERSION
+# GET DOWNLOAD URLS FOR A VERSION
 # ==========================================
 
-select_version() {
-    local SELECTED_VERSION="$LATEST_VERSION"
+get_download_urls() {
+    local VERSION="$1"
 
-    if [ "$IS_PIPED" = true ]; then
-        log_info "Auto-selecting latest: $LATEST_VERSION"
-    elif [ -n "$1" ]; then
-        SELECTED_VERSION="$1"
-        log_info "Using specified version: $SELECTED_VERSION"
+    local RELEASES_JSON=""
+    if [ "$DOWNLOADER" = "curl" ]; then
+        RELEASES_JSON=$(curl -sL "$GITHUB_API" 2>/dev/null)
     else
-        echo -e "${WHITE}Options:${NC}"
-        echo "  1) Install latest ($LATEST_VERSION)"
-        echo "  2) Choose a different version"
-        echo ""
-
-        local VERSION_CHOICE
-        safe_read "Choice (1-2): " VERSION_CHOICE "1"
-
-        if [ "$VERSION_CHOICE" = "2" ] && [ -n "$AVAILABLE_VERSIONS" ]; then
-            echo ""
-            echo -e "${WHITE}Available versions:${NC}"
-            local VERSIONS_ARRAY=()
-            local COUNT=0
-            while IFS='|' read -r tag name date assets extra; do
-                COUNT=$((COUNT + 1))
-                VERSIONS_ARRAY+=("$tag")
-                echo -e "  ${CYAN}$COUNT)${NC} $tag  ($date) $extra"
-            done <<< "$AVAILABLE_VERSIONS"
-            echo ""
-
-            local VER_NUM
-            safe_read "Enter number: " VER_NUM "1"
-
-            local IDX=$((VER_NUM - 1))
-            if [ $IDX -ge 0 ] && [ $IDX -lt ${#VERSIONS_ARRAY[@]} ]; then
-                SELECTED_VERSION="${VERSIONS_ARRAY[$IDX]}"
-            fi
-        fi
+        RELEASES_JSON=$(wget -qO- "$GITHUB_API" 2>/dev/null)
     fi
 
-    log_success "Selected version: $SELECTED_VERSION"
-    INSTALL_VERSION="$SELECTED_VERSION"
-
-    # Refresh download URLs for selected version
-    if [ "$SELECTED_VERSION" != "$LATEST_VERSION" ]; then
-        local RELEASES_JSON=""
-        if [ "$DOWNLOADER" = "curl" ]; then
-            RELEASES_JSON=$(curl -sL "$GITHUB_API" 2>/dev/null)
-        else
-            RELEASES_JSON=$(wget -qO- "$GITHUB_API" 2>/dev/null)
-        fi
-
-        DOWNLOAD_URLS=$(echo "$RELEASES_JSON" | python3 -c "
+    DOWNLOAD_URLS=$(echo "$RELEASES_JSON" | python3 -c "
 import sys, json
 try:
     releases = json.load(sys.stdin)
     if isinstance(releases, list):
         for r in releases:
-            if r.get('tag_name', '') == '$SELECTED_VERSION':
+            if r.get('tag_name', '') == '$VERSION':
                 for a in r.get('assets', []):
                     name = a.get('name', '')
                     url = a.get('browser_download_url', '')
@@ -283,9 +317,64 @@ try:
                     size_mb = round(size / 1024 / 1024, 1)
                     print(f'{name}|{url}|{size_mb}')
                 break
-except: pass
+except:
+    pass
 " 2>/dev/null)
+}
+
+# ==========================================
+# SELECT VERSION
+# ==========================================
+
+select_version() {
+    INSTALL_VERSION="$LATEST_VERSION"
+
+    # If version passed as argument
+    if [ -n "$1" ]; then
+        INSTALL_VERSION="$1"
+        log_info "Using specified version: $INSTALL_VERSION"
+        get_download_urls "$INSTALL_VERSION"
+        return
     fi
+
+    # Auto mode
+    if [ "$IS_PIPED" = true ]; then
+        log_info "Auto-selecting: $LATEST_VERSION"
+        get_download_urls "$INSTALL_VERSION"
+        return
+    fi
+
+    echo -e "${WHITE}Options:${NC}"
+    echo "  1) Install latest ($LATEST_VERSION)"
+    echo "  2) Choose a different version"
+    echo ""
+
+    local VERSION_CHOICE
+    safe_read "Choice (1-2): " VERSION_CHOICE "1"
+
+    if [ "$VERSION_CHOICE" = "2" ] && [ -n "$AVAILABLE_VERSIONS" ]; then
+        echo ""
+        echo -e "${WHITE}Select version:${NC}"
+        local VERSIONS_ARRAY=()
+        local COUNT=0
+        while IFS='|' read -r tag name date assets marker; do
+            COUNT=$((COUNT + 1))
+            VERSIONS_ARRAY+=("$tag")
+            echo -e "  ${CYAN}$COUNT)${NC} $tag  ($date)${YELLOW}$marker${NC}"
+        done <<< "$AVAILABLE_VERSIONS"
+        echo ""
+
+        local VER_NUM
+        safe_read "Enter number: " VER_NUM "1"
+
+        local IDX=$((VER_NUM - 1))
+        if [ $IDX -ge 0 ] && [ $IDX -lt ${#VERSIONS_ARRAY[@]} ]; then
+            INSTALL_VERSION="${VERSIONS_ARRAY[$IDX]}"
+        fi
+    fi
+
+    log_success "Selected: $INSTALL_VERSION"
+    get_download_urls "$INSTALL_VERSION"
 }
 
 # ==========================================
@@ -298,93 +387,112 @@ download_binary() {
     mkdir -p "$INSTALL_DIR"
 
     if [ -z "$DOWNLOAD_URLS" ]; then
-        log_error "No download URLs found for $INSTALL_VERSION"
+        log_error "No downloads found for $INSTALL_VERSION"
+        log_info "Check: https://github.com/$GITHUB_REPO/releases/tag/$INSTALL_VERSION"
         exit 1
     fi
 
-    # Show available files
-    echo -e "${WHITE}Available downloads:${NC}"
-    local FILE_ARRAY=()
-    local URL_ARRAY=()
-    local SIZE_ARRAY=()
-    local COUNT=0
+    # Show available Linux files
+    echo -e "${WHITE}Available downloads for $INSTALL_VERSION:${NC}"
+    local ALL_FILES=()
+    local ALL_URLS=()
+    local ALL_SIZES=()
+    local LINUX_COUNT=0
 
     while IFS='|' read -r filename url size; do
-        COUNT=$((COUNT + 1))
-        FILE_ARRAY+=("$filename")
-        URL_ARRAY+=("$url")
-        SIZE_ARRAY+=("$size")
+        ALL_FILES+=("$filename")
+        ALL_URLS+=("$url")
+        ALL_SIZES+=("$size")
 
-        local ICON="📦"
-        if echo "$filename" | grep -qi "appimage"; then
-            ICON="📦"
-        elif echo "$filename" | grep -qi "tar.gz"; then
-            ICON="📁"
-        elif echo "$filename" | grep -qi "install.sh"; then
-            ICON="📜"
-        elif echo "$filename" | grep -qi "windows\|\.exe"; then
-            ICON="🪟"
-        elif echo "$filename" | grep -qi "macos\|darwin"; then
-            ICON="🍎"
-        fi
+        # Show Linux-relevant files
+        if echo "$filename" | grep -qiE "linux|appimage|install\.sh|\.tar\.gz"; then
+            LINUX_COUNT=$((LINUX_COUNT + 1))
 
-        # Only show Linux files
-        if echo "$filename" | grep -qi "linux\|appimage\|install.sh"; then
-            echo -e "  ${CYAN}$COUNT)${NC} $ICON $filename  (${size} MB)"
+            local ICON="📦"
+            if echo "$filename" | grep -qi "appimage"; then
+                ICON="📦 AppImage"
+            elif echo "$filename" | grep -qi "tar.gz"; then
+                ICON="📁 Portable"
+            elif echo "$filename" | grep -qi "install"; then
+                ICON="📜 Script"
+            fi
+
+            echo -e "  ${CYAN}${#ALL_FILES[@]})${NC} $ICON  $filename  (${size} MB)"
         fi
     done <<< "$DOWNLOAD_URLS"
+
+    if [ $LINUX_COUNT -eq 0 ]; then
+        echo -e "  ${YELLOW}No Linux-specific files found. Showing all:${NC}"
+        local IDX=0
+        for f in "${ALL_FILES[@]}"; do
+            IDX=$((IDX + 1))
+            echo -e "  ${CYAN}$IDX)${NC} $f  (${ALL_SIZES[$((IDX-1))]} MB)"
+        done
+    fi
     echo ""
 
-    # Find best file for this architecture
+    # Auto-select best file
     local DOWNLOAD_URL=""
     local DOWNLOAD_FILE=""
 
-    # Priority: AppImage > tar.gz portable
-    for priority in "AppImage" "Linux.*tar.gz" "linux.*tar.gz"; do
-        while IFS='|' read -r filename url size; do
-            if echo "$filename" | grep -qi "$priority"; then
-                DOWNLOAD_URL="$url"
-                DOWNLOAD_FILE="$filename"
+    # Priority order for auto-detection
+    local PATTERNS=(
+        "Linux.*\.tar\.gz"
+        "linux.*\.tar\.gz"
+        "Linux.*AppImage"
+        "linux.*AppImage"
+    )
+
+    for pattern in "${PATTERNS[@]}"; do
+        local IDX=0
+        for f in "${ALL_FILES[@]}"; do
+            if echo "$f" | grep -qiE "$pattern"; then
+                DOWNLOAD_URL="${ALL_URLS[$IDX]}"
+                DOWNLOAD_FILE="$f"
                 break 2
             fi
-        done <<< "$DOWNLOAD_URLS"
+            IDX=$((IDX + 1))
+        done
     done
 
+    # If auto-detect failed, let user choose
     if [ -z "$DOWNLOAD_URL" ]; then
-        # Let user choose
-        log_warn "Could not auto-detect Linux binary."
-        echo -e "${WHITE}All available files:${NC}"
-        COUNT=0
-        while IFS='|' read -r filename url size; do
-            COUNT=$((COUNT + 1))
-            echo -e "  ${CYAN}$COUNT)${NC} $filename  (${size} MB)"
-        done <<< "$DOWNLOAD_URLS"
-        echo ""
-
-        local FILE_NUM
-        safe_read "Choose file number: " FILE_NUM "1"
-
-        local IDX=$((FILE_NUM - 1))
-        if [ $IDX -ge 0 ] && [ $IDX -lt ${#URL_ARRAY[@]} ]; then
-            DOWNLOAD_URL="${URL_ARRAY[$IDX]}"
-            DOWNLOAD_FILE="${FILE_ARRAY[$IDX]}"
+        if [ "$IS_PIPED" = true ]; then
+            # In pipe mode, try first file
+            if [ ${#ALL_URLS[@]} -gt 0 ]; then
+                DOWNLOAD_URL="${ALL_URLS[0]}"
+                DOWNLOAD_FILE="${ALL_FILES[0]}"
+            else
+                log_error "No files to download"
+                exit 1
+            fi
         else
-            log_error "Invalid choice"
-            exit 1
+            local FILE_NUM
+            safe_read "Choose file number: " FILE_NUM "1"
+
+            local IDX=$((FILE_NUM - 1))
+            if [ $IDX -ge 0 ] && [ $IDX -lt ${#ALL_URLS[@]} ]; then
+                DOWNLOAD_URL="${ALL_URLS[$IDX]}"
+                DOWNLOAD_FILE="${ALL_FILES[$IDX]}"
+            else
+                log_error "Invalid choice"
+                exit 1
+            fi
         fi
     fi
 
     log_info "Downloading: $DOWNLOAD_FILE"
-    log_info "URL: $DOWNLOAD_URL"
 
     local DOWNLOAD_PATH="$INSTALL_DIR/$DOWNLOAD_FILE"
 
     # Download with progress
+    echo ""
     if [ "$DOWNLOADER" = "curl" ]; then
         curl -L --progress-bar "$DOWNLOAD_URL" -o "$DOWNLOAD_PATH"
     else
         wget --show-progress -q "$DOWNLOAD_URL" -O "$DOWNLOAD_PATH"
     fi
+    echo ""
 
     if [ ! -f "$DOWNLOAD_PATH" ] || [ ! -s "$DOWNLOAD_PATH" ]; then
         log_error "Download failed!"
@@ -394,27 +502,30 @@ download_binary() {
     local FILE_SIZE=$(du -sh "$DOWNLOAD_PATH" | cut -f1)
     log_success "Downloaded: $DOWNLOAD_FILE ($FILE_SIZE)"
 
+    # ==========================================
     # Extract or prepare binary
+    # ==========================================
     BINARY_PATH=""
 
     if echo "$DOWNLOAD_FILE" | grep -qi "\.tar\.gz$"; then
         log_info "Extracting archive..."
-        tar -xzf "$DOWNLOAD_PATH" -C "$INSTALL_DIR"
+        tar -xzf "$DOWNLOAD_PATH" -C "$INSTALL_DIR" 2>/dev/null
         rm -f "$DOWNLOAD_PATH"
 
-        # Find the binary
-        BINARY_PATH=$(find "$INSTALL_DIR" -name "${APP_NAME}*" -type f -executable 2>/dev/null | head -1)
+        # Find the binary inside extracted folder
+        BINARY_PATH=$(find "$INSTALL_DIR" -type f -name "${APP_NAME}*" ! -name "*.py" ! -name "*.yml" ! -name "*.md" ! -name "*.sh" ! -name "*.txt" | head -1)
 
         if [ -z "$BINARY_PATH" ]; then
-            BINARY_PATH=$(find "$INSTALL_DIR" -name "${APP_NAME}*" -type f 2>/dev/null | head -1)
+            # Try finding any executable
+            BINARY_PATH=$(find "$INSTALL_DIR" -type f -executable ! -name "*.py" ! -name "*.sh" | head -1)
         fi
 
         if [ -n "$BINARY_PATH" ]; then
             chmod +x "$BINARY_PATH"
-            log_success "Extracted: $BINARY_PATH"
+            log_success "Extracted: $(basename "$BINARY_PATH")"
         else
             log_error "Could not find binary after extraction"
-            log_info "Contents of $INSTALL_DIR:"
+            log_info "Contents:"
             find "$INSTALL_DIR" -type f | head -20
             exit 1
         fi
@@ -422,16 +533,20 @@ download_binary() {
     elif echo "$DOWNLOAD_FILE" | grep -qi "\.appimage$"; then
         chmod +x "$DOWNLOAD_PATH"
         BINARY_PATH="$DOWNLOAD_PATH"
-        log_success "AppImage ready: $BINARY_PATH"
+        log_success "AppImage ready"
 
     else
         chmod +x "$DOWNLOAD_PATH"
         BINARY_PATH="$DOWNLOAD_PATH"
-        log_success "Binary ready: $BINARY_PATH"
+        log_success "Binary ready"
     fi
 
-    # Save binary path
+    # Save paths and version
     echo "$BINARY_PATH" > "$INSTALL_DIR/.binary_path"
+    echo "$INSTALL_VERSION" > "$INSTALL_DIR/.version"
+
+    local FINAL_SIZE=$(du -sh "$BINARY_PATH" | cut -f1)
+    log_success "Binary: $(basename "$BINARY_PATH") ($FINAL_SIZE)"
 }
 
 # ==========================================
@@ -453,31 +568,40 @@ check_ollama() {
             if command -v ollama &>/dev/null; then
                 log_success "Ollama installed!"
             else
-                log_error "Failed. Try: curl -fsSL https://ollama.com/install.sh | sh"
+                log_warn "Failed. Try: curl -fsSL https://ollama.com/install.sh | sh"
             fi
+        else
+            log_warn "Skipping. Install later: curl -fsSL https://ollama.com/install.sh | sh"
         fi
     fi
 
+    # Check server
     if command -v ollama &>/dev/null; then
         if curl -s http://localhost:11434/api/tags &>/dev/null; then
             log_success "Ollama server running"
         else
             local START_OLLAMA
-            safe_read "Start Ollama? (y/n): " START_OLLAMA "y"
+            safe_read "Start Ollama server? (y/n): " START_OLLAMA "y"
             if [[ "$START_OLLAMA" =~ ^[Yy]$ ]]; then
                 log_info "Starting Ollama..."
+
+                # Try systemd
                 if systemctl list-unit-files 2>/dev/null | grep -q ollama; then
                     sudo systemctl start ollama 2>/dev/null || true
+                    sudo systemctl enable ollama 2>/dev/null || true
                     sleep 3
                 fi
+
+                # Try manual
                 if ! curl -s http://localhost:11434/api/tags &>/dev/null; then
                     nohup ollama serve > /dev/null 2>&1 &
                     sleep 5
                 fi
+
                 if curl -s http://localhost:11434/api/tags &>/dev/null; then
                     log_success "Ollama started"
                 else
-                    log_warn "Could not verify. Try: ollama serve"
+                    log_warn "Could not verify. Try manually: ollama serve"
                 fi
             fi
         fi
@@ -491,11 +615,17 @@ check_ollama() {
 pull_orion_model() {
     log_step "Pull Orion Model"
 
+    if ! command -v ollama &>/dev/null; then
+        log_warn "Ollama not installed. Skipping."
+        return
+    fi
+
     if ! curl -s http://localhost:11434/api/tags &>/dev/null; then
         log_warn "Ollama not running. Skipping."
         return
     fi
 
+    # Check if already installed
     if curl -s http://localhost:11434/api/tags | grep -q "Orion"; then
         log_success "Orion model already installed"
         return
@@ -503,12 +633,12 @@ pull_orion_model() {
 
     if [ "$IS_PIPED" = true ]; then
         log_info "Pulling OmniNode/Orion:V1.1..."
-        ollama pull OmniNode/Orion:V1.1
+        ollama pull OmniNode/Orion:V1.1 && log_success "Orion V1.1 downloaded!" || log_warn "Pull failed"
         return
     fi
 
     echo ""
-    echo -e "${WHITE}Available:${NC}"
+    echo -e "${WHITE}Available Orion versions:${NC}"
     echo "  1) OmniNode/Orion:V1.1 (latest)"
     echo "  2) OmniNode/Orion:V1.0"
     echo "  3) Skip"
@@ -518,9 +648,17 @@ pull_orion_model() {
     safe_read "Choose (1-3): " MODEL_CHOICE "1"
 
     case $MODEL_CHOICE in
-        1) ollama pull OmniNode/Orion:V1.1 && log_success "V1.1 downloaded!" ;;
-        2) ollama pull OmniNode/Orion:V1.0 && log_success "V1.0 downloaded!" ;;
-        *) log_info "Pull later: ollama pull OmniNode/Orion:V1.1" ;;
+        1) 
+            log_info "Pulling OmniNode/Orion:V1.1..."
+            ollama pull OmniNode/Orion:V1.1 && log_success "V1.1 downloaded!" || log_warn "Pull failed"
+            ;;
+        2) 
+            log_info "Pulling OmniNode/Orion:V1.0..."
+            ollama pull OmniNode/Orion:V1.0 && log_success "V1.0 downloaded!" || log_warn "Pull failed"
+            ;;
+        *) 
+            log_info "Pull later: ollama pull OmniNode/Orion:V1.1"
+            ;;
     esac
 }
 
@@ -542,20 +680,24 @@ install_integration() {
     fi
 
     if [ -z "$BINARY_PATH" ] || [ ! -f "$BINARY_PATH" ]; then
-        BINARY_PATH=$(find "$INSTALL_DIR" -name "${APP_NAME}*" -type f -executable 2>/dev/null | head -1)
+        BINARY_PATH=$(find "$INSTALL_DIR" -type f -name "${APP_NAME}*" -executable ! -name "*.py" ! -name "*.sh" 2>/dev/null | head -1)
     fi
 
-    if [ -z "$BINARY_PATH" ]; then
+    if [ -z "$BINARY_PATH" ] || [ ! -f "$BINARY_PATH" ]; then
         log_error "Binary not found in $INSTALL_DIR"
+        log_info "Contents:"
+        find "$INSTALL_DIR" -type f | head -20
         exit 1
     fi
+
+    log_info "Binary: $BINARY_PATH"
 
     # ==========================================
     # Launcher
     # ==========================================
     cat > "$BIN_DIR/orion-gui" << LAUNCHEREOF
 #!/bin/bash
-# Orion GUI Launcher
+# Orion GUI Launcher - by OmniNode
 
 BINARY="$BINARY_PATH"
 
@@ -566,7 +708,7 @@ NC='\033[0m'
 
 echo -e "\${PURPLE}◉ Orion GUI\${NC}"
 
-# Start Ollama
+# Start Ollama if needed
 if command -v ollama &>/dev/null; then
     if ! curl -s http://localhost:11434/api/tags &>/dev/null 2>&1; then
         echo -e "\${CYAN}Starting Ollama...\${NC}"
@@ -591,18 +733,47 @@ fi
 
 # Open browser
 if command -v xdg-open &>/dev/null; then
-    (sleep 2 && xdg-open "http://localhost:5000") &
+    (sleep 2 && xdg-open "http://localhost:5000") &>/dev/null 2>&1 &
 fi
 
 echo -e "\${CYAN}🌐 http://localhost:5000\${NC}"
 echo "Press Ctrl+C to stop"
 echo ""
 
-exec "\$BINARY" "\$@"
+if [ -f "\$BINARY" ]; then
+    exec "\$BINARY" "\$@"
+else
+    echo "❌ Binary not found: \$BINARY"
+    echo "Reinstall: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPO/main/install.sh | bash"
+    exit 1
+fi
 LAUNCHEREOF
 
     chmod +x "$BIN_DIR/orion-gui"
     log_success "Launcher: orion-gui"
+
+    # ==========================================
+    # Update command
+    # ==========================================
+    cat > "$BIN_DIR/orion-gui-update" << UPDATEEOF
+#!/bin/bash
+# Orion GUI Updater
+echo "🔄 Checking for updates..."
+
+SCRIPT_URL="https://raw.githubusercontent.com/$GITHUB_REPO/main/install.sh"
+TEMP_SCRIPT=\$(mktemp)
+
+if curl -sL "\$SCRIPT_URL" -o "\$TEMP_SCRIPT" 2>/dev/null; then
+    chmod +x "\$TEMP_SCRIPT"
+    exec bash "\$TEMP_SCRIPT" --update
+else
+    echo "❌ Could not download updater"
+    echo "Manual: curl -fsSL \$SCRIPT_URL | bash"
+fi
+UPDATEEOF
+
+    chmod +x "$BIN_DIR/orion-gui-update"
+    log_success "Updater: orion-gui-update"
 
     # ==========================================
     # Desktop entry
@@ -637,9 +808,13 @@ DESKTOPEOF
 </svg>
 SVGEOF
 
+    # Try to convert SVG to PNG
     if command -v convert &>/dev/null; then
         convert "$ICON_DIR/orion-gui.svg" -resize 256x256 "$ICON_DIR/orion-gui.png" 2>/dev/null || true
+    elif command -v rsvg-convert &>/dev/null; then
+        rsvg-convert -w 256 -h 256 "$ICON_DIR/orion-gui.svg" -o "$ICON_DIR/orion-gui.png" 2>/dev/null || true
     fi
+
     gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
     log_success "Icon installed"
 
@@ -648,7 +823,9 @@ SVGEOF
     # ==========================================
     cat > "$BIN_DIR/orion-gui-uninstall" << UNINSTALLEOF
 #!/bin/bash
+echo ""
 echo "🗑 Uninstalling Orion GUI..."
+echo ""
 
 if [ -t 0 ]; then
     read -p "Are you sure? (y/n): " CONFIRM </dev/tty
@@ -661,23 +838,33 @@ if [[ ! "\$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
+echo ""
+
+# Stop service
 systemctl --user stop orion-gui 2>/dev/null || true
 systemctl --user disable orion-gui 2>/dev/null || true
-rm -f "$HOME/.config/systemd/user/orion-gui.service"
+rm -f "$HOME/.config/systemd/user/orion-gui.service" 2>/dev/null
 systemctl --user daemon-reload 2>/dev/null || true
 
+# Remove files
 rm -rf "$INSTALL_DIR"
 rm -f "$BIN_DIR/orion-gui"
+rm -f "$BIN_DIR/orion-gui-update"
 rm -f "$BIN_DIR/orion-gui-uninstall"
 rm -f "$DESKTOP_DIR/orion-gui.desktop"
 rm -f "$ICON_DIR/orion-gui.svg"
 rm -f "$ICON_DIR/orion-gui.png"
 
+# Update caches
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 echo "✅ Orion GUI uninstalled!"
-echo "Ollama and models were NOT removed."
+echo ""
+echo "Note: Ollama and models were NOT removed."
+echo "  Remove Ollama: sudo rm /usr/local/bin/ollama"
+echo "  Remove models: rm -rf ~/.ollama"
+echo ""
 UNINSTALLEOF
 
     chmod +x "$BIN_DIR/orion-gui-uninstall"
@@ -686,10 +873,27 @@ UNINSTALLEOF
     # ==========================================
     # Systemd service
     # ==========================================
-    local SERVICE_DIR="$HOME/.config/systemd/user"
-    mkdir -p "$SERVICE_DIR"
+    if [ "$EUID" -eq 0 ]; then
+        local SERVICE_FILE="/etc/systemd/system/orion-gui.service"
+        cat > "$SERVICE_FILE" << SERVICEEOF
+[Unit]
+Description=Orion GUI
+After=network.target ollama.service
 
-    cat > "$SERVICE_DIR/orion-gui.service" << SERVICEEOF
+[Service]
+Type=simple
+ExecStart=$BINARY_PATH
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+        systemctl daemon-reload 2>/dev/null || true
+    else
+        local SERVICE_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$SERVICE_DIR"
+        cat > "$SERVICE_DIR/orion-gui.service" << SERVICEEOF
 [Unit]
 Description=Orion GUI
 After=network.target
@@ -703,8 +907,9 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 SERVICEEOF
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
 
-    systemctl --user daemon-reload 2>/dev/null || true
     log_success "Systemd service: orion-gui"
 }
 
@@ -734,6 +939,8 @@ add_to_path() {
             echo "# Orion GUI" >> "$SHELL_RC"
             echo "export PATH=\"$BIN_DIR:\$PATH\"" >> "$SHELL_RC"
             log_success "Added to $SHELL_RC"
+        else
+            log_success "Already in $SHELL_RC"
         fi
     fi
 
@@ -746,11 +953,15 @@ add_to_path() {
 
 print_summary() {
     local BINARY_PATH=""
+    local VERSION=""
+    local FINAL_SIZE=""
+
     if [ -f "$INSTALL_DIR/.binary_path" ]; then
         BINARY_PATH=$(cat "$INSTALL_DIR/.binary_path")
     fi
-
-    local FINAL_SIZE=""
+    if [ -f "$INSTALL_DIR/.version" ]; then
+        VERSION=$(cat "$INSTALL_DIR/.version")
+    fi
     if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
         FINAL_SIZE=$(du -sh "$BINARY_PATH" | cut -f1)
     fi
@@ -762,30 +973,38 @@ print_summary() {
     echo "╚══════════════════════════════════════════╝"
     echo -e "${NC}"
     echo ""
-    echo -e "${WHITE}📦 Version:${NC}     $INSTALL_VERSION"
+    [ -n "$VERSION" ]    && echo -e "${WHITE}📦 Version:${NC}     $VERSION"
     [ -n "$FINAL_SIZE" ] && echo -e "${WHITE}📏 Size:${NC}        $FINAL_SIZE"
     echo -e "${WHITE}📁 Location:${NC}    $INSTALL_DIR"
     echo -e "${WHITE}🚀 Launch:${NC}      orion-gui"
     echo -e "${WHITE}🌐 URL:${NC}         http://localhost:5000"
-    echo -e "${WHITE}🗑  Uninstall:${NC}   orion-gui-uninstall"
     echo -e "${WHITE}🔄 Update:${NC}      orion-gui-update"
+    echo -e "${WHITE}🗑  Uninstall:${NC}   orion-gui-uninstall"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -e "  ${GREEN}orion-gui${NC}                         Launch"
+    echo -e "  ${GREEN}orion-gui${NC}                         Launch GUI"
+    echo -e "  ${GREEN}orion-gui-update${NC}                  Check for updates"
     echo -e "  ${GREEN}ollama pull OmniNode/Orion:V1.1${NC}   Pull model"
     echo -e "  ${GREEN}orion-gui-uninstall${NC}               Remove"
     echo ""
-    echo -e "  ${GREEN}systemctl --user enable orion-gui${NC}  Auto-start"
-    echo -e "  ${GREEN}systemctl --user start orion-gui${NC}   Start now"
+
+    if [ "$EUID" -eq 0 ]; then
+        echo -e "  ${GREEN}sudo systemctl enable orion-gui${NC}   Auto-start"
+        echo -e "  ${GREEN}sudo systemctl start orion-gui${NC}    Start now"
+    else
+        echo -e "  ${GREEN}systemctl --user enable orion-gui${NC}  Auto-start"
+        echo -e "  ${GREEN}systemctl --user start orion-gui${NC}   Start now"
+    fi
+
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-    # Reload shell hint
+    # Shell reload hint
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
         echo ""
-        echo -e "${YELLOW}⚠️  Run this to use orion-gui now:${NC}"
-        echo -e "  ${GREEN}source ~/.bashrc${NC}  (or restart terminal)"
+        echo -e "${YELLOW}⚠️  To use orion-gui right now, run:${NC}"
+        echo -e "  ${GREEN}source ~/${SHELL_RC##*/}${NC}  or restart your terminal"
         echo ""
     fi
 }
@@ -812,7 +1031,7 @@ full_install() {
             exec "$BIN_DIR/orion-gui"
         fi
     else
-        log_info "Run 'orion-gui' to start"
+        log_info "Run 'orion-gui' to start (restart terminal first)"
     fi
 }
 
@@ -821,36 +1040,59 @@ full_install() {
 # ==========================================
 
 update_install() {
-    log_step "Updating Orion GUI"
-
     check_system
-    fetch_releases
 
-    # Check current version
+    # Check current
     local CURRENT=""
     if [ -f "$INSTALL_DIR/.version" ]; then
         CURRENT=$(cat "$INSTALL_DIR/.version")
+        log_info "Current version: $CURRENT"
+    else
+        log_warn "No version info found"
     fi
 
-    if [ "$CURRENT" = "$LATEST_VERSION" ]; then
+    fetch_releases
+
+    if [ -n "$CURRENT" ] && [ "$CURRENT" = "$LATEST_VERSION" ]; then
         log_success "Already on latest: $LATEST_VERSION"
+
+        if [ "$IS_PIPED" = true ]; then
+            log_info "No update needed"
+            return
+        fi
+
         local FORCE
         safe_read "Reinstall anyway? (y/n): " FORCE "n"
         if [[ ! "$FORCE" =~ ^[Yy]$ ]]; then
             return
         fi
     else
-        log_info "Current: ${CURRENT:-unknown} → Latest: $LATEST_VERSION"
+        if [ -n "$CURRENT" ]; then
+            log_info "Updating: $CURRENT → $LATEST_VERSION"
+        fi
     fi
 
-    select_version
+    select_version "$1"
+
+    # Backup old binary path
+    local OLD_BINARY=""
+    if [ -f "$INSTALL_DIR/.binary_path" ]; then
+        OLD_BINARY=$(cat "$INSTALL_DIR/.binary_path")
+    fi
+
     download_binary
     install_integration
-
-    # Save version
-    echo "$INSTALL_VERSION" > "$INSTALL_DIR/.version"
+    
+    # Clean old binary if path changed
+    if [ -n "$OLD_BINARY" ] && [ -f "$INSTALL_DIR/.binary_path" ]; then
+        local NEW_BINARY=$(cat "$INSTALL_DIR/.binary_path")
+        if [ "$OLD_BINARY" != "$NEW_BINARY" ] && [ -f "$OLD_BINARY" ]; then
+            rm -f "$OLD_BINARY" 2>/dev/null || true
+        fi
+    fi
 
     log_success "Updated to $INSTALL_VERSION!"
+    print_summary
 }
 
 # ==========================================
@@ -860,9 +1102,11 @@ update_install() {
 check_status() {
     log_step "System Status"
 
-    # Version
+    # Installed version
     if [ -f "$INSTALL_DIR/.version" ]; then
-        log_success "Version: $(cat "$INSTALL_DIR/.version")"
+        log_success "Installed: $(cat "$INSTALL_DIR/.version")"
+    else
+        log_error "Orion GUI: not installed"
     fi
 
     # Binary
@@ -874,8 +1118,6 @@ check_status() {
         else
             log_error "Binary missing: $BP"
         fi
-    else
-        log_error "Not installed"
     fi
 
     # Launcher
@@ -901,7 +1143,13 @@ check_status() {
 
     # Ollama server
     if curl -s http://localhost:11434/api/tags &>/dev/null; then
-        local MODELS=$(curl -s http://localhost:11434/api/tags | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('models',[])))" 2>/dev/null || echo "?")
+        local MODELS=$(curl -s http://localhost:11434/api/tags | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(len(data.get('models', [])))
+except: print('?')
+" 2>/dev/null)
         log_success "Ollama server: running ($MODELS models)"
     else
         log_error "Ollama server: not running"
@@ -912,6 +1160,55 @@ check_status() {
         log_success "Orion model: installed"
     else
         log_warn "Orion model: not found"
+    fi
+
+    # Check for updates
+    echo ""
+    log_info "Checking for updates..."
+    local CURRENT=""
+    if [ -f "$INSTALL_DIR/.version" ]; then
+        CURRENT=$(cat "$INSTALL_DIR/.version")
+    fi
+
+    local REMOTE_LATEST=""
+    if [ -n "$DOWNLOADER" ]; then
+        :
+    elif command -v curl &>/dev/null; then
+        DOWNLOADER="curl"
+    elif command -v wget &>/dev/null; then
+        DOWNLOADER="wget"
+    fi
+
+    if [ -n "$DOWNLOADER" ]; then
+        local API_RESPONSE=""
+        if [ "$DOWNLOADER" = "curl" ]; then
+            API_RESPONSE=$(curl -sL "$GITHUB_API/latest" 2>/dev/null || curl -sL "$GITHUB_API" 2>/dev/null)
+        else
+            API_RESPONSE=$(wget -qO- "$GITHUB_API/latest" 2>/dev/null || wget -qO- "$GITHUB_API" 2>/dev/null)
+        fi
+
+        REMOTE_LATEST=$(echo "$API_RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, dict):
+        print(data.get('tag_name', ''))
+    elif isinstance(data, list) and data:
+        for r in data:
+            if not r.get('draft', False):
+                print(r.get('tag_name', ''))
+                break
+except: pass
+" 2>/dev/null)
+    fi
+
+    if [ -n "$REMOTE_LATEST" ] && [ -n "$CURRENT" ]; then
+        if [ "$CURRENT" = "$REMOTE_LATEST" ]; then
+            log_success "Up to date ($CURRENT)"
+        else
+            log_warn "Update available: $CURRENT → $REMOTE_LATEST"
+            log_info "Run: orion-gui-update"
+        fi
     fi
 
     echo ""
@@ -926,7 +1223,12 @@ uninstall() {
         exec "$BIN_DIR/orion-gui-uninstall"
     else
         log_error "Uninstaller not found"
-        log_info "Manual: rm -rf $INSTALL_DIR && rm -f $BIN_DIR/orion-gui"
+        log_info "Manual removal:"
+        echo "  rm -rf $INSTALL_DIR"
+        echo "  rm -f $BIN_DIR/orion-gui"
+        echo "  rm -f $BIN_DIR/orion-gui-update"
+        echo "  rm -f $BIN_DIR/orion-gui-uninstall"
+        echo "  rm -f $DESKTOP_DIR/orion-gui.desktop"
     fi
 }
 
@@ -938,19 +1240,20 @@ show_menu() {
     print_banner
 
     if [ "$IS_PIPED" = true ]; then
-        log_info "Pipe mode → auto installing latest"
+        log_info "Pipe mode → installing latest automatically"
+        echo ""
         full_install
         return
     fi
 
     echo -e "${WHITE}Choose an option:${NC}"
     echo ""
-    echo "  1) 🚀 Full Install (download + install)"
+    echo "  1) 🚀 Full Install (download latest)"
     echo "  2) 📦 Install Ollama only"
     echo "  3) 🔄 Update to latest version"
     echo "  4) 📥 Pull Orion model only"
-    echo "  5) 🗑  Uninstall"
-    echo "  6) 🔍 Check status"
+    echo "  5) 🔍 Check status"
+    echo "  6) 🗑  Uninstall"
     echo "  7) ❌ Exit"
     echo ""
 
@@ -962,8 +1265,8 @@ show_menu() {
         2) check_system && check_ollama ;;
         3) update_install ;;
         4) pull_orion_model ;;
-        5) uninstall ;;
-        6) check_status ;;
+        5) check_status ;;
+        6) uninstall ;;
         7) echo "Goodbye! 👋" && exit 0 ;;
         *) log_error "Invalid choice" && show_menu ;;
     esac
@@ -975,7 +1278,7 @@ show_menu() {
 
 case "${1:-}" in
     --install|-i)   full_install "$2" ;;
-    --update|-u)    update_install ;;
+    --update|-u)    update_install "$2" ;;
     --uninstall|-r) uninstall ;;
     --status|-s)    check_status ;;
     --ollama)       check_system && check_ollama ;;
@@ -989,25 +1292,32 @@ case "${1:-}" in
         ;;
     --help|-h)
         echo ""
-        echo "◉ Orion GUI Installer"
+        echo "◉ Orion GUI Installer - by OmniNode"
         echo ""
         echo "Usage: ./install.sh [option] [version]"
         echo ""
         echo "Options:"
         echo "  --install, -i [ver]  Install (latest or specific version)"
-        echo "  --update, -u         Update to latest"
-        echo "  --uninstall, -r      Remove"
-        echo "  --status, -s         Check status"
+        echo "  --update, -u         Update to latest version"
+        echo "  --uninstall, -r      Remove Orion GUI"
+        echo "  --status, -s         Check status + update check"
         echo "  --version, -v        Show installed version"
-        echo "  --ollama             Install Ollama"
+        echo "  --ollama             Install Ollama only"
         echo "  --pull               Pull Orion model"
-        echo "  --help, -h           Show help"
+        echo "  --help, -h           Show this help"
         echo ""
         echo "Examples:"
-        echo "  ./install.sh                    Interactive menu"
-        echo "  ./install.sh --install          Install latest"
-        echo "  ./install.sh --install v1.0.0   Install specific version"
-        echo "  curl ... | bash                 Auto install latest"
+        echo "  ./install.sh                      Interactive menu"
+        echo "  ./install.sh --install            Install latest"
+        echo "  ./install.sh --install 1.0-beta   Install specific version"
+        echo "  ./install.sh --update             Update to latest"
+        echo "  ./install.sh --status             Check everything"
+        echo "  curl ... | bash                   Auto install latest"
+        echo ""
+        echo "After install:"
+        echo "  orion-gui                         Launch GUI"
+        echo "  orion-gui-update                  Check for updates"
+        echo "  orion-gui-uninstall               Remove GUI"
         echo ""
         ;;
     *)
