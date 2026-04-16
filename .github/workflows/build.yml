@@ -222,6 +222,24 @@ jobs:
               i.start()
           PYEOF
 
+      - name: 📝 Generate install.sh
+        run: |
+          if [ -f "install.sh" ]; then
+            echo "✅ install.sh already exists in repo"
+          else
+            curl -sL "${{ github.server_url }}/${{ github.repository }}/raw/main/install.sh" -o install.sh 2>/dev/null || {
+              echo "⚠️ Could not download install.sh, creating minimal version"
+              cat > install.sh << 'SHEOF'
+          #!/bin/bash
+          echo "◉ Orion GUI Installer"
+          echo "Please download the full install.sh from:"
+          echo "https://github.com/OmniNode/Orion"
+          SHEOF
+            }
+          fi
+          chmod +x install.sh
+          echo "✅ install.sh ready"
+
       - name: 🎨 Generate Icons
         run: |
           cat > orion.svg << 'SVG'
@@ -284,6 +302,7 @@ jobs:
           path: |
             config.yml
             install_ollama.py
+            install.sh
             orion.ico
             orion.png
             appimage-build/
@@ -322,7 +341,10 @@ jobs:
 
       - name: 📋 Verify Files
         run: |
-          for f in app.py config.yml install_ollama.py; do
+          echo "📁 All files:"
+          ls -la
+          echo ""
+          for f in app.py config.yml install_ollama.py install.sh; do
             echo "$f: $(test -f $f && echo '✅' || echo '❌')"
           done
           for d in templates static; do
@@ -357,25 +379,26 @@ jobs:
           mkdir -p release/OrionGUI-Linux
           cp dist/${{ env.APP_NAME }}-Linux release/OrionGUI-Linux/
           cp install_ollama.py release/OrionGUI-Linux/
+          cp install.sh release/OrionGUI-Linux/ || true
           cp config.yml release/OrionGUI-Linux/
           cp README.md release/OrionGUI-Linux/ || true
           chmod +x release/OrionGUI-Linux/${{ env.APP_NAME }}-Linux
+          chmod +x release/OrionGUI-Linux/install.sh || true
           cd release
           tar -czf ../OrionGUI-Linux-${VERSION}.tar.gz OrionGUI-Linux/
 
-      - name: 📦 Install FUSE for AppImage
+      - name: 📦 Install AppImage Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libfuse2 fuse > /dev/null 2>&1 || true
-
-          # Also install static appimagetool that doesn't need FUSE
-          echo "✅ FUSE setup complete"
+          sudo apt-get install -y -qq libfuse2 fuse squashfs-tools > /dev/null 2>&1 || true
+          echo "✅ AppImage dependencies installed"
 
       - name: 📦 Build AppImage
+        continue-on-error: true
         run: |
           VERSION=${{ needs.check-updates.outputs.latest_version }}
 
-          # Download appimagetool (static version that works without FUSE)
+          # Download appimagetool
           wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
           chmod +x appimagetool
 
@@ -405,31 +428,48 @@ jobs:
           cp appimage-build/orion.png AppDir/usr/share/icons/hicolor/256x256/apps/orion.png
           cp appimage-build/orion.png AppDir/.DirIcon
 
-          # Verify AppDir structure
           echo "📁 AppDir structure:"
-          find AppDir -type f | head -20
+          find AppDir -type f
 
-          # Build AppImage using --appimage-extract-and-run to avoid FUSE requirement
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OrionGUI-Linux-${VERSION}.AppImage
-
-          if [ $? -eq 0 ]; then
+          # Method 1: --appimage-extract-and-run
+          echo "🔨 Building AppImage (method 1)..."
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OrionGUI-Linux-${VERSION}.AppImage 2>&1 && {
             chmod +x OrionGUI-Linux-${VERSION}.AppImage
-            echo "✅ AppImage built successfully!"
+            echo "✅ AppImage built (method 1)!"
             ls -lh OrionGUI-Linux-${VERSION}.AppImage
-          else
-            echo "❌ AppImage build failed, trying alternative method..."
+            exit 0
+          }
 
-            # Alternative: extract appimagetool and run directly
-            ./appimagetool --appimage-extract > /dev/null 2>&1
-            if [ -d "squashfs-root" ]; then
-              ARCH=x86_64 squashfs-root/AppRun AppDir OrionGUI-Linux-${VERSION}.AppImage
+          # Method 2: Extract appimagetool first
+          echo "🔨 Trying method 2..."
+          ./appimagetool --appimage-extract > /dev/null 2>&1 || true
+          if [ -d "squashfs-root" ]; then
+            ARCH=x86_64 ./squashfs-root/AppRun AppDir OrionGUI-Linux-${VERSION}.AppImage 2>&1 && {
               chmod +x OrionGUI-Linux-${VERSION}.AppImage
-              echo "✅ AppImage built with alternative method!"
+              echo "✅ AppImage built (method 2)!"
               ls -lh OrionGUI-Linux-${VERSION}.AppImage
-            else
-              echo "❌ Both methods failed, creating tar.gz only"
+              exit 0
+            }
+          fi
+
+          # Method 3: Use mksquashfs directly
+          echo "🔨 Trying method 3 (manual squashfs)..."
+          if command -v mksquashfs &>/dev/null; then
+            # Download runtime
+            wget -q "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64" -O runtime
+            mksquashfs AppDir squashfs.img -root-owned -noappend -comp zstd 2>/dev/null || \
+            mksquashfs AppDir squashfs.img -root-owned -noappend 2>/dev/null
+            
+            if [ -f "squashfs.img" ] && [ -f "runtime" ]; then
+              cat runtime squashfs.img > OrionGUI-Linux-${VERSION}.AppImage
+              chmod +x OrionGUI-Linux-${VERSION}.AppImage
+              echo "✅ AppImage built (method 3)!"
+              ls -lh OrionGUI-Linux-${VERSION}.AppImage
+              exit 0
             fi
           fi
+
+          echo "⚠️ AppImage build failed - portable tar.gz still available"
 
       - name: 📤 Upload Linux Portable
         uses: actions/upload-artifact@v4
@@ -440,10 +480,18 @@ jobs:
 
       - name: 📤 Upload Linux AppImage
         uses: actions/upload-artifact@v4
-        if: hashFiles('OrionGUI-Linux-*.AppImage') != ''
+        if: ${{ hashFiles('OrionGUI-Linux-*.AppImage') != '' }}
         with:
           name: OrionGUI-Linux-AppImage
           path: OrionGUI-Linux-*.AppImage
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 📤 Upload install.sh
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-script
+          path: install.sh
           retention-days: 30
 
   # ==========================================
@@ -529,10 +577,8 @@ jobs:
         shell: pwsh
         run: |
           $VERSION = "${{ needs.check-updates.outputs.latest_version }}"
-
           New-Item -ItemType Directory -Force -Path "output"
 
-          # Create clean Inno Setup script
           $issContent = @"
           [Setup]
           AppName=Orion GUI
@@ -567,7 +613,6 @@ jobs:
           Source: "dist\OrionGUI-Windows.exe"; DestDir: "{app}"; Flags: ignoreversion
           Source: "install_ollama.py"; DestDir: "{app}"; Flags: ignoreversion
           Source: "config.yml"; DestDir: "{app}"; Flags: ignoreversion
-          Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
           [Icons]
           Name: "{group}\Orion GUI"; Filename: "{app}\OrionGUI-Windows.exe"
@@ -578,29 +623,33 @@ jobs:
           Filename: "{app}\OrionGUI-Windows.exe"; Description: "Launch Orion GUI"; Flags: nowait postinstall skipifsilent shellexec
           "@
 
-          # Write with ASCII encoding (Inno Setup requirement)
-          [System.IO.File]::WriteAllText("OrionSetup.iss", $issContent, [System.Text.Encoding]::ASCII)
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "OrionSetup.iss"),
+            $issContent,
+            [System.Text.Encoding]::ASCII
+          )
 
           Write-Host "✅ Inno Setup script created"
-          Write-Host ""
-          Write-Host "📋 Script contents:"
-          Get-Content "OrionSetup.iss"
-          Write-Host ""
 
-          # Compile
+          # Find ISCC
           $isccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $isccPath)) {
-            $isccPath = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+            $isccPath = (Get-ChildItem -Path "C:\Program Files*" -Recurse -Filter "ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          }
+
+          if (-not $isccPath) {
+            Write-Host "❌ ISCC.exe not found"
+            exit 1
           }
 
           Write-Host "🔨 Compiling with: $isccPath"
           & $isccPath "OrionSetup.iss"
 
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "✅ Windows Setup installer built!"
+            Write-Host "✅ Setup installer built!"
             Get-ChildItem output
           } else {
-            Write-Host "❌ Inno Setup build failed with exit code: $LASTEXITCODE"
+            Write-Host "❌ Build failed: $LASTEXITCODE"
             exit 1
           }
 
@@ -796,7 +845,6 @@ jobs:
         run: |
           mkdir -p release-files
 
-          # Find all release files
           find artifacts -type f \( \
             -name "*.tar.gz" -o \
             -name "*.zip" -o \
@@ -806,6 +854,9 @@ jobs:
             cp "$file" release-files/
             echo "  📦 $(basename $file)"
           done
+
+          # Also include install.sh
+          find artifacts -name "install.sh" -exec cp {} release-files/ \; 2>/dev/null || true
 
           echo ""
           echo "📦 All release files:"
@@ -821,10 +872,14 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.version }}
 
-          # Check which files exist
           HAS_APPIMAGE="false"
           if ls release-files/*.AppImage 1>/dev/null 2>&1; then
             HAS_APPIMAGE="true"
+          fi
+
+          HAS_SETUP="false"
+          if ls release-files/*Setup*.exe 1>/dev/null 2>&1; then
+            HAS_SETUP="true"
           fi
 
           cat > changelog.md << REOF
@@ -846,6 +901,8 @@ jobs:
           #### 🐧 Linux
           | Type | File | Description |
           |------|------|-------------|
+          | 📁 Portable | \`OrionGUI-Linux-${VERSION}.tar.gz\` | Extract and run |
+          | 📜 Install Script | \`install.sh\` | Full guided installer |
           REOF
 
           if [ "$HAS_APPIMAGE" = "true" ]; then
@@ -853,12 +910,17 @@ jobs:
           fi
 
           cat >> changelog.md << REOF
-          | 📁 Portable | \`OrionGUI-Linux-${VERSION}.tar.gz\` | Extract and run |
 
           #### 🪟 Windows
           | Type | File | Description |
           |------|------|-------------|
-          | 🔧 Setup | \`OrionGUI-Windows-Setup-${VERSION}.exe\` | Full installer with shortcuts |
+          REOF
+
+          if [ "$HAS_SETUP" = "true" ]; then
+            echo "| 🔧 Setup | \`OrionGUI-Windows-Setup-${VERSION}.exe\` | Full installer with shortcuts |" >> changelog.md
+          fi
+
+          cat >> changelog.md << REOF
           | 📁 Portable | \`OrionGUI-Windows-Portable-${VERSION}.zip\` | No install needed |
 
           #### 🍎 macOS
@@ -869,27 +931,26 @@ jobs:
 
           ### 🚀 Quick Start
 
-          **Linux (AppImage):**
+          **Linux (one-liner install):**
           \`\`\`bash
-          chmod +x OrionGUI-Linux-${VERSION}.AppImage
-          ./OrionGUI-Linux-${VERSION}.AppImage
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
           \`\`\`
 
-          **Linux (Portable):**
+          **Linux (portable):**
           \`\`\`bash
           tar -xzf OrionGUI-Linux-${VERSION}.tar.gz
           cd OrionGUI-Linux/
           ./OrionGUI-Linux
           \`\`\`
 
-          **Windows (Setup):**
+          **Windows (setup):**
           \`\`\`
           1. Run OrionGUI-Windows-Setup-${VERSION}.exe
           2. Follow installer
           3. Launch from Start Menu or Desktop
           \`\`\`
 
-          **Windows (Portable):**
+          **Windows (portable):**
           \`\`\`
           1. Extract ZIP
           2. Run OrionGUI-Windows.exe
@@ -955,8 +1016,8 @@ jobs:
           echo "✅ Release ${VERSION} created!"
           echo ""
           echo "📌 Downloads:"
-          echo "  🐧 AppImage:      https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.AppImage"
           echo "  🐧 Portable:      https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.tar.gz"
+          echo "  🐧 Install:       https://github.com/${REPO}/releases/download/${VERSION}/install.sh"
           echo "  🪟 Setup:         https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-Setup-${VERSION}.exe"
           echo "  🪟 Portable:      https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-Portable-${VERSION}.zip"
           echo "  🍎 macOS ARM:     https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-ARM-${VERSION}.tar.gz"
@@ -974,11 +1035,16 @@ jobs:
 
           | Platform | Type | Link |
           |----------|------|------|
-          | 🐧 Linux | AppImage | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.AppImage) |
           | 🐧 Linux | Portable | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.tar.gz) |
+          | 🐧 Linux | Install Script | [Download](https://github.com/${REPO}/releases/download/${VERSION}/install.sh) |
           | 🪟 Windows | Setup | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-Setup-${VERSION}.exe) |
           | 🪟 Windows | Portable | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-Portable-${VERSION}.zip) |
           | 🍎 macOS | Apple Silicon | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-ARM-${VERSION}.tar.gz) |
           | 🍎 macOS | Intel | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-Intel-${VERSION}.tar.gz) |
+
+          ### 🐧 Linux One-Liner Install
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
+          \`\`\`
 
           EOF
