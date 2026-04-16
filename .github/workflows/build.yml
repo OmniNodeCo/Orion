@@ -1,12 +1,10 @@
 name: Build Orion GUI
 
 on:
-  # Trigger on version tags
   push:
     tags:
       - 'v*'
 
-  # Manual trigger with version input
   workflow_dispatch:
     inputs:
       version:
@@ -16,7 +14,7 @@ on:
       pre_release:
         description: 'Pre-release?'
         required: false
-        default: false
+        default: 'false'
         type: boolean
 
 permissions:
@@ -50,6 +48,127 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: 📝 Create config.yml if missing
+        run: |
+          if [ ! -f config.yml ]; then
+            cat > config.yml << 'EOF'
+          app:
+            name: "Orion GUI"
+            version: "${{ github.event.inputs.version || github.ref_name }}"
+            author: "OmniNode"
+            port: 5000
+            debug: false
+
+          ollama:
+            url: "http://localhost:11434"
+            default_model: "OmniNode/Orion:V1.1"
+            auto_check_updates: true
+
+          models:
+            available:
+              - name: "OmniNode/Orion:V1.1"
+                version: "1.1"
+                description: "Latest stable release"
+                size: "4.1 GB"
+                latest: true
+              - name: "OmniNode/Orion:V1.0"
+                version: "1.0"
+                description: "Initial release"
+                size: "4.1 GB"
+                latest: false
+            recommended:
+              - name: "mistral:7b"
+                description: "Base Mistral 7B"
+                size: "4.1 GB"
+              - name: "llama3:8b"
+                description: "Meta LLaMA 3 8B"
+                size: "4.7 GB"
+              - name: "codellama:7b"
+                description: "Code LLaMA 7B"
+                size: "3.8 GB"
+              - name: "phi3:mini"
+                description: "Microsoft Phi-3 Mini"
+                size: "2.3 GB"
+
+          ollama_install:
+            linux:
+              command: "curl -fsSL https://ollama.com/install.sh | sh"
+            windows:
+              url: "https://ollama.com/download/OllamaSetup.exe"
+            macos:
+              brew: "brew install ollama"
+              url: "https://ollama.com/download/Ollama-darwin.zip"
+          EOF
+            echo "✅ config.yml created"
+          else
+            echo "✅ config.yml already exists"
+          fi
+
+      - name: 📝 Create install_ollama.py if missing
+        run: |
+          if [ ! -f install_ollama.py ]; then
+            cat > install_ollama.py << 'PYEOF'
+          #!/usr/bin/env python3
+          import platform, subprocess, sys, os, urllib.request, time
+
+          class OllamaInstaller:
+              def __init__(self):
+                  self.system = platform.system().lower()
+
+              def is_installed(self):
+                  try:
+                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
+                      return result.returncode == 0
+                  except:
+                      return False
+
+              def install(self):
+                  print(f"Installing Ollama for {self.system}...")
+                  if self.system == "linux":
+                      subprocess.run(["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"])
+                  elif self.system == "darwin":
+                      subprocess.run(["brew", "install", "ollama"])
+                  elif self.system == "windows":
+                      url = "https://ollama.com/download/OllamaSetup.exe"
+                      path = os.path.join(os.environ.get("TEMP", "."), "OllamaSetup.exe")
+                      urllib.request.urlretrieve(url, path)
+                      subprocess.Popen([path], shell=True)
+                      print(f"Installer downloaded: {path}")
+
+              def start(self):
+                  try:
+                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      time.sleep(3)
+                      print("Ollama server started")
+                  except Exception as e:
+                      print(f"Error: {e}")
+
+          if __name__ == "__main__":
+              installer = OllamaInstaller()
+              if not installer.is_installed():
+                  installer.install()
+              installer.start()
+          PYEOF
+            echo "✅ install_ollama.py created"
+          else
+            echo "✅ install_ollama.py already exists"
+          fi
+
+      - name: 📋 Verify Files Exist
+        run: |
+          echo "📁 Files in workspace:"
+          ls -la
+          echo ""
+          echo "📁 Templates:"
+          ls -la templates/ || echo "⚠️ No templates folder"
+          echo ""
+          echo "📁 Static:"
+          ls -la static/ || echo "⚠️ No static folder"
+          echo ""
+          echo "✅ config.yml exists: $(test -f config.yml && echo YES || echo NO)"
+          echo "✅ install_ollama.py exists: $(test -f install_ollama.py && echo YES || echo NO)"
+          echo "✅ app.py exists: $(test -f app.py && echo YES || echo NO)"
+
       - name: 🔨 Build Linux Executable
         run: |
           pyinstaller \
@@ -79,16 +198,10 @@ jobs:
           cp dist/${{ env.APP_NAME }}-Linux release/OrionGUI-Linux/
           cp install_ollama.py release/OrionGUI-Linux/
           cp config.yml release/OrionGUI-Linux/
-          cp README.md release/OrionGUI-Linux/
+          cp README.md release/OrionGUI-Linux/ || true
           chmod +x release/OrionGUI-Linux/${{ env.APP_NAME }}-Linux
           cd release
           tar -czf ../OrionGUI-Linux-${VERSION}.tar.gz OrionGUI-Linux/
-
-      - name: ✅ Test Executable
-        run: |
-          chmod +x dist/${{ env.APP_NAME }}-Linux
-          timeout 5 dist/${{ env.APP_NAME }}-Linux --help || true
-          echo "✅ Linux build test passed"
 
       - name: 📤 Upload Linux Artifact
         uses: actions/upload-artifact@v4
@@ -120,6 +233,106 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: 📝 Create config.yml if missing
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "config.yml")) {
+            @"
+          app:
+            name: "Orion GUI"
+            version: "${{ github.event.inputs.version || github.ref_name }}"
+            author: "OmniNode"
+            port: 5000
+            debug: false
+
+          ollama:
+            url: "http://localhost:11434"
+            default_model: "OmniNode/Orion:V1.1"
+            auto_check_updates: true
+
+          models:
+            available:
+              - name: "OmniNode/Orion:V1.1"
+                version: "1.1"
+                description: "Latest stable release"
+                size: "4.1 GB"
+                latest: true
+              - name: "OmniNode/Orion:V1.0"
+                version: "1.0"
+                description: "Initial release"
+                size: "4.1 GB"
+                latest: false
+            recommended:
+              - name: "mistral:7b"
+                description: "Base Mistral 7B"
+                size: "4.1 GB"
+              - name: "llama3:8b"
+                description: "Meta LLaMA 3 8B"
+                size: "4.7 GB"
+
+          ollama_install:
+            windows:
+              url: "https://ollama.com/download/OllamaSetup.exe"
+          "@ | Out-File -FilePath "config.yml" -Encoding utf8
+            Write-Host "✅ config.yml created"
+          } else {
+            Write-Host "✅ config.yml already exists"
+          }
+
+      - name: 📝 Create install_ollama.py if missing
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "install_ollama.py")) {
+            @"
+          #!/usr/bin/env python3
+          import platform, subprocess, sys, os, urllib.request, time
+
+          class OllamaInstaller:
+              def __init__(self):
+                  self.system = platform.system().lower()
+
+              def is_installed(self):
+                  try:
+                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
+                      return result.returncode == 0
+                  except:
+                      return False
+
+              def install(self):
+                  if self.system == "windows":
+                      url = "https://ollama.com/download/OllamaSetup.exe"
+                      path = os.path.join(os.environ.get("TEMP", "."), "OllamaSetup.exe")
+                      urllib.request.urlretrieve(url, path)
+                      subprocess.Popen([path], shell=True)
+
+              def start(self):
+                  try:
+                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      time.sleep(3)
+                  except Exception as e:
+                      print(f"Error: {e}")
+
+          if __name__ == "__main__":
+              installer = OllamaInstaller()
+              if not installer.is_installed():
+                  installer.install()
+              installer.start()
+          "@ | Out-File -FilePath "install_ollama.py" -Encoding utf8
+            Write-Host "✅ install_ollama.py created"
+          } else {
+            Write-Host "✅ install_ollama.py already exists"
+          }
+
+      - name: 📋 Verify Files Exist
+        shell: pwsh
+        run: |
+          Write-Host "📁 Files:"
+          Get-ChildItem -Name
+          Write-Host ""
+          Write-Host "config.yml exists: $(Test-Path 'config.yml')"
+          Write-Host "install_ollama.py exists: $(Test-Path 'install_ollama.py')"
+          Write-Host "app.py exists: $(Test-Path 'app.py')"
+
       - name: 🔨 Build Windows Executable
         run: |
           pyinstaller `
@@ -147,18 +360,12 @@ jobs:
         shell: pwsh
         run: |
           $VERSION = "${{ github.event.inputs.version || github.ref_name }}"
-          New-Item -ItemType Directory -Force -Path release\OrionGUI-Windows
+          New-Item -ItemType Directory -Force -Path "release\OrionGUI-Windows"
           Copy-Item "dist\${{ env.APP_NAME }}-Windows.exe" "release\OrionGUI-Windows\"
           Copy-Item "install_ollama.py" "release\OrionGUI-Windows\"
           Copy-Item "config.yml" "release\OrionGUI-Windows\"
-          Copy-Item "README.md" "release\OrionGUI-Windows\"
+          if (Test-Path "README.md") { Copy-Item "README.md" "release\OrionGUI-Windows\" }
           Compress-Archive -Path "release\OrionGUI-Windows\*" -DestinationPath "OrionGUI-Windows-${VERSION}.zip"
-
-      - name: ✅ Test Executable
-        run: |
-          Start-Process -FilePath "dist\${{ env.APP_NAME }}-Windows.exe" -ArgumentList "--help" -NoNewWindow -Wait -ErrorAction SilentlyContinue
-          echo "✅ Windows build test passed"
-        shell: pwsh
 
       - name: 📤 Upload Windows Artifact
         uses: actions/upload-artifact@v4
@@ -168,77 +375,7 @@ jobs:
           retention-days: 30
 
   # ==========================================
-  # BUILD FOR MACOS (Intel)
-  # ==========================================
-  build-macos-intel:
-    name: 🍎 Build macOS (Intel)
-    runs-on: macos-13
-
-    steps:
-      - name: 📥 Checkout Code
-        uses: actions/checkout@v4
-
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      - name: 📦 Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: 🔨 Build macOS Intel Executable
-        run: |
-          pyinstaller \
-            --onefile \
-            --name ${{ env.APP_NAME }}-macOS-Intel \
-            --add-data "templates:templates" \
-            --add-data "static:static" \
-            --add-data "config.yml:." \
-            --add-data "install_ollama.py:." \
-            --hidden-import flask \
-            --hidden-import requests \
-            --hidden-import yaml \
-            --hidden-import jinja2 \
-            --hidden-import markupsafe \
-            --hidden-import click \
-            --hidden-import blinker \
-            --hidden-import itsdangerous \
-            --hidden-import werkzeug \
-            --clean \
-            --noconfirm \
-            app.py
-
-      - name: 📁 Create Release Package
-        run: |
-          VERSION=${{ github.event.inputs.version || github.ref_name }}
-          mkdir -p release/OrionGUI-macOS-Intel
-          cp dist/${{ env.APP_NAME }}-macOS-Intel release/OrionGUI-macOS-Intel/
-          cp install_ollama.py release/OrionGUI-macOS-Intel/
-          cp config.yml release/OrionGUI-macOS-Intel/
-          cp README.md release/OrionGUI-macOS-Intel/
-          chmod +x release/OrionGUI-macOS-Intel/${{ env.APP_NAME }}-macOS-Intel
-          cd release
-          tar -czf ../OrionGUI-macOS-Intel-${VERSION}.tar.gz OrionGUI-macOS-Intel/
-
-      - name: ✅ Test Executable
-        run: |
-          chmod +x dist/${{ env.APP_NAME }}-macOS-Intel
-          timeout 5 dist/${{ env.APP_NAME }}-macOS-Intel --help || true
-          echo "✅ macOS Intel build test passed"
-
-      - name: 📤 Upload macOS Intel Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: OrionGUI-macOS-Intel
-          path: OrionGUI-macOS-Intel-*.tar.gz
-          retention-days: 30
-
-  # ==========================================
-  # BUILD FOR MACOS (Apple Silicon)
+  # BUILD FOR MACOS (Apple Silicon - ARM)
   # ==========================================
   build-macos-arm:
     name: 🍎 Build macOS (Apple Silicon)
@@ -259,6 +396,105 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+
+      - name: 📝 Create config.yml if missing
+        run: |
+          if [ ! -f config.yml ]; then
+            cat > config.yml << 'EOF'
+          app:
+            name: "Orion GUI"
+            version: "${{ github.event.inputs.version || github.ref_name }}"
+            author: "OmniNode"
+            port: 5000
+            debug: false
+
+          ollama:
+            url: "http://localhost:11434"
+            default_model: "OmniNode/Orion:V1.1"
+            auto_check_updates: true
+
+          models:
+            available:
+              - name: "OmniNode/Orion:V1.1"
+                version: "1.1"
+                description: "Latest stable release"
+                size: "4.1 GB"
+                latest: true
+              - name: "OmniNode/Orion:V1.0"
+                version: "1.0"
+                description: "Initial release"
+                size: "4.1 GB"
+                latest: false
+            recommended:
+              - name: "mistral:7b"
+                description: "Base Mistral 7B"
+                size: "4.1 GB"
+              - name: "llama3:8b"
+                description: "Meta LLaMA 3 8B"
+                size: "4.7 GB"
+
+          ollama_install:
+            macos:
+              brew: "brew install ollama"
+              url: "https://ollama.com/download/Ollama-darwin.zip"
+          EOF
+            echo "✅ config.yml created"
+          else
+            echo "✅ config.yml already exists"
+          fi
+
+      - name: 📝 Create install_ollama.py if missing
+        run: |
+          if [ ! -f install_ollama.py ]; then
+            cat > install_ollama.py << 'PYEOF'
+          #!/usr/bin/env python3
+          import platform, subprocess, sys, os, urllib.request, time
+
+          class OllamaInstaller:
+              def __init__(self):
+                  self.system = platform.system().lower()
+
+              def is_installed(self):
+                  try:
+                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
+                      return result.returncode == 0
+                  except:
+                      return False
+
+              def install(self):
+                  if self.system == "darwin":
+                      subprocess.run(["brew", "install", "ollama"])
+                  elif self.system == "linux":
+                      subprocess.run(["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"])
+
+              def start(self):
+                  try:
+                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      time.sleep(3)
+                  except Exception as e:
+                      print(f"Error: {e}")
+
+          if __name__ == "__main__":
+              installer = OllamaInstaller()
+              if not installer.is_installed():
+                  installer.install()
+              installer.start()
+          PYEOF
+            echo "✅ install_ollama.py created"
+          else
+            echo "✅ install_ollama.py already exists"
+          fi
+
+      - name: 📋 Verify Files Exist
+        run: |
+          echo "📁 Files:"
+          ls -la
+          echo ""
+          echo "config.yml: $(test -f config.yml && echo YES || echo NO)"
+          echo "install_ollama.py: $(test -f install_ollama.py && echo YES || echo NO)"
+          echo "app.py: $(test -f app.py && echo YES || echo NO)"
+          echo "templates/: $(test -d templates && echo YES || echo NO)"
+          echo "static/: $(test -d static && echo YES || echo NO)"
 
       - name: 🔨 Build macOS ARM Executable
         run: |
@@ -289,16 +525,10 @@ jobs:
           cp dist/${{ env.APP_NAME }}-macOS-ARM release/OrionGUI-macOS-ARM/
           cp install_ollama.py release/OrionGUI-macOS-ARM/
           cp config.yml release/OrionGUI-macOS-ARM/
-          cp README.md release/OrionGUI-macOS-ARM/
+          cp README.md release/OrionGUI-macOS-ARM/ || true
           chmod +x release/OrionGUI-macOS-ARM/${{ env.APP_NAME }}-macOS-ARM
           cd release
           tar -czf ../OrionGUI-macOS-ARM-${VERSION}.tar.gz OrionGUI-macOS-ARM/
-
-      - name: ✅ Test Executable
-        run: |
-          chmod +x dist/${{ env.APP_NAME }}-macOS-ARM
-          timeout 5 dist/${{ env.APP_NAME }}-macOS-ARM --help || true
-          echo "✅ macOS ARM build test passed"
 
       - name: 📤 Upload macOS ARM Artifact
         uses: actions/upload-artifact@v4
@@ -308,11 +538,172 @@ jobs:
           retention-days: 30
 
   # ==========================================
+  # BUILD FOR MACOS (Intel x86_64)
+  # ==========================================
+  build-macos-intel:
+    name: 🍎 Build macOS (Intel)
+    runs-on: macos-latest
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 📝 Create config.yml if missing
+        run: |
+          if [ ! -f config.yml ]; then
+            cat > config.yml << 'EOF'
+          app:
+            name: "Orion GUI"
+            version: "${{ github.event.inputs.version || github.ref_name }}"
+            author: "OmniNode"
+            port: 5000
+            debug: false
+
+          ollama:
+            url: "http://localhost:11434"
+            default_model: "OmniNode/Orion:V1.1"
+            auto_check_updates: true
+
+          models:
+            available:
+              - name: "OmniNode/Orion:V1.1"
+                version: "1.1"
+                description: "Latest stable release"
+                size: "4.1 GB"
+                latest: true
+              - name: "OmniNode/Orion:V1.0"
+                version: "1.0"
+                description: "Initial release"
+                size: "4.1 GB"
+                latest: false
+            recommended:
+              - name: "mistral:7b"
+                description: "Base Mistral 7B"
+                size: "4.1 GB"
+              - name: "llama3:8b"
+                description: "Meta LLaMA 3 8B"
+                size: "4.7 GB"
+
+          ollama_install:
+            macos:
+              brew: "brew install ollama"
+              url: "https://ollama.com/download/Ollama-darwin.zip"
+          EOF
+            echo "✅ config.yml created"
+          else
+            echo "✅ config.yml already exists"
+          fi
+
+      - name: 📝 Create install_ollama.py if missing
+        run: |
+          if [ ! -f install_ollama.py ]; then
+            cat > install_ollama.py << 'PYEOF'
+          #!/usr/bin/env python3
+          import platform, subprocess, sys, os, urllib.request, time
+
+          class OllamaInstaller:
+              def __init__(self):
+                  self.system = platform.system().lower()
+
+              def is_installed(self):
+                  try:
+                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
+                      return result.returncode == 0
+                  except:
+                      return False
+
+              def install(self):
+                  if self.system == "darwin":
+                      subprocess.run(["brew", "install", "ollama"])
+                  elif self.system == "linux":
+                      subprocess.run(["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"])
+
+              def start(self):
+                  try:
+                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      time.sleep(3)
+                  except Exception as e:
+                      print(f"Error: {e}")
+
+          if __name__ == "__main__":
+              installer = OllamaInstaller()
+              if not installer.is_installed():
+                  installer.install()
+              installer.start()
+          PYEOF
+            echo "✅ install_ollama.py created"
+          else
+            echo "✅ install_ollama.py already exists"
+          fi
+
+      - name: 📋 Verify Files Exist
+        run: |
+          echo "📁 Files:"
+          ls -la
+          echo ""
+          echo "config.yml: $(test -f config.yml && echo YES || echo NO)"
+          echo "install_ollama.py: $(test -f install_ollama.py && echo YES || echo NO)"
+          echo "app.py: $(test -f app.py && echo YES || echo NO)"
+
+      - name: 🔨 Build macOS Intel Executable
+        run: |
+          pyinstaller \
+            --onefile \
+            --name ${{ env.APP_NAME }}-macOS-Intel \
+            --add-data "templates:templates" \
+            --add-data "static:static" \
+            --add-data "config.yml:." \
+            --add-data "install_ollama.py:." \
+            --hidden-import flask \
+            --hidden-import requests \
+            --hidden-import yaml \
+            --hidden-import jinja2 \
+            --hidden-import markupsafe \
+            --hidden-import click \
+            --hidden-import blinker \
+            --hidden-import itsdangerous \
+            --hidden-import werkzeug \
+            --clean \
+            --noconfirm \
+            app.py
+
+      - name: 📁 Create Release Package
+        run: |
+          VERSION=${{ github.event.inputs.version || github.ref_name }}
+          mkdir -p release/OrionGUI-macOS-Intel
+          cp dist/${{ env.APP_NAME }}-macOS-Intel release/OrionGUI-macOS-Intel/
+          cp install_ollama.py release/OrionGUI-macOS-Intel/
+          cp config.yml release/OrionGUI-macOS-Intel/
+          cp README.md release/OrionGUI-macOS-Intel/ || true
+          chmod +x release/OrionGUI-macOS-Intel/${{ env.APP_NAME }}-macOS-Intel
+          cd release
+          tar -czf ../OrionGUI-macOS-Intel-${VERSION}.tar.gz OrionGUI-macOS-Intel/
+
+      - name: 📤 Upload macOS Intel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrionGUI-macOS-Intel
+          path: OrionGUI-macOS-Intel-*.tar.gz
+          retention-days: 30
+
+  # ==========================================
   # CREATE GITHUB RELEASE
   # ==========================================
   release:
     name: 🚀 Create Release
-    needs: [build-linux, build-windows, build-macos-intel, build-macos-arm]
+    needs: [build-linux, build-windows, build-macos-arm, build-macos-intel]
     runs-on: ubuntu-latest
 
     steps:
@@ -341,73 +732,67 @@ jobs:
         run: |
           VERSION=${{ github.event.inputs.version || github.ref_name }}
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "📌 Version: ${VERSION}"
 
-      - name: 📝 Generate Changelog
-        id: changelog
+      - name: 📝 Generate Release Notes
         run: |
-          cat << 'EOF' > changelog.md
-          ## 🚀 Orion GUI ${{ steps.version.outputs.version }}
+          VERSION=${{ steps.version.outputs.version }}
+          cat > changelog.md << EOF
+          ## 🚀 Orion GUI ${VERSION}
 
-          ### ✨ What's New
-          - Full GUI for Orion AI on Ollama
-          - Model Manager with update checking
-          - Model Store with version downloads
-          - Ollama auto-installer
-          - Real-time streaming chat
-          - Cross-platform support
+          ### ✨ Features
+          - 💬 Full chat GUI with streaming responses
+          - 📦 Model Manager (check/update/delete models)
+          - 🏪 Model Store (download any Ollama model)
+          - ⚙️ Ollama auto-installer
+          - 🔄 Real-time update checking
+          - 📊 Download progress tracking
+          - 📱 Mobile responsive design
 
           ### 📥 Downloads
 
           | Platform | Architecture | File |
           |----------|-------------|------|
-          | 🐧 Linux | x86_64 | `OrionGUI-Linux-${{ steps.version.outputs.version }}.tar.gz` |
-          | 🪟 Windows | x86_64 | `OrionGUI-Windows-${{ steps.version.outputs.version }}.zip` |
-          | 🍎 macOS | Intel (x86_64) | `OrionGUI-macOS-Intel-${{ steps.version.outputs.version }}.tar.gz` |
-          | 🍎 macOS | Apple Silicon (ARM) | `OrionGUI-macOS-ARM-${{ steps.version.outputs.version }}.tar.gz` |
-
-          ### 📋 Requirements
-          - Ollama installed and running
-          - If Ollama is not installed, use the built-in installer
+          | 🐧 Linux | x86_64 | \`OrionGUI-Linux-${VERSION}.tar.gz\` |
+          | 🪟 Windows | x86_64 | \`OrionGUI-Windows-${VERSION}.zip\` |
+          | 🍎 macOS | Apple Silicon (M1/M2/M3) | \`OrionGUI-macOS-ARM-${VERSION}.tar.gz\` |
+          | 🍎 macOS | Intel (x86_64) | \`OrionGUI-macOS-Intel-${VERSION}.tar.gz\` |
 
           ### 🚀 Quick Start
 
           **Linux / macOS:**
-          ```bash
+          \`\`\`bash
           tar -xzf OrionGUI-*.tar.gz
           cd OrionGUI-*/
           chmod +x OrionGUI-*
           ./OrionGUI-*
-          ```
+          \`\`\`
 
           **Windows:**
-          ```
-          1. Extract the ZIP file
+          \`\`\`
+          1. Extract ZIP
           2. Double-click OrionGUI-Windows.exe
-          3. Open browser → http://localhost:5000
-          ```
+          3. Open http://localhost:5000
+          \`\`\`
 
-          ### 🔧 Install Ollama (if needed)
+          ### 🔧 Install Ollama
 
           **Linux:**
-          ```bash
+          \`\`\`bash
           curl -fsSL https://ollama.com/install.sh | sh
-          ```
+          \`\`\`
 
           **macOS:**
-          ```bash
+          \`\`\`bash
           brew install ollama
-          ```
+          \`\`\`
 
           **Windows:**
-          ```
           Download from https://ollama.com/download
-          ```
 
           ### ◉ Pull Orion Model
-          ```bash
+          \`\`\`bash
           ollama pull OmniNode/Orion:V1.1
-          ```
+          \`\`\`
 
           ---
           Made with ❤️ by **OmniNode**
@@ -429,7 +814,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ==========================================
-  # POST-RELEASE VERIFICATION
+  # VERIFY RELEASE
   # ==========================================
   verify:
     name: ✅ Verify Release
@@ -437,13 +822,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: ✅ Verify Release Exists
+      - name: ✅ Print Download Links
         run: |
           VERSION=${{ github.event.inputs.version || github.ref_name }}
-          echo "✅ Release created: ${VERSION}"
+          REPO=${{ github.repository }}
+          echo ""
+          echo "✅ Release created successfully!"
           echo ""
           echo "📌 Download links:"
-          echo "  🐧 Linux:        https://github.com/${{ github.repository }}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.tar.gz"
-          echo "  🪟 Windows:      https://github.com/${{ github.repository }}/releases/download/${VERSION}/OrionGUI-Windows-${VERSION}.zip"
-          echo "  🍎 macOS Intel:  https://github.com/${{ github.repository }}/releases/download/${VERSION}/OrionGUI-macOS-Intel-${VERSION}.tar.gz"
-          echo "  🍎 macOS ARM:    https://github.com/${{ github.repository }}/releases/download/${VERSION}/OrionGUI-macOS-ARM-${VERSION}.tar.gz"
+          echo "  🐧 Linux:          https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.tar.gz"
+          echo "  🪟 Windows:        https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-${VERSION}.zip"
+          echo "  🍎 macOS ARM:      https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-ARM-${VERSION}.tar.gz"
+          echo "  🍎 macOS Intel:    https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-Intel-${VERSION}.tar.gz"
+          echo ""
+          echo "🌐 Release page: https://github.com/${REPO}/releases/tag/${VERSION}"

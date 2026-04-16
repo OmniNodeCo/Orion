@@ -1,0 +1,67 @@
+# Orion GUI Configuration
+app:
+  name: "Orion GUI"
+  version: "1.1.0"
+  author: "OmniNode"
+  description: "GUI for Orion AI running on Ollama"
+  port: 5000
+  debug: false
+
+ollama:
+  url: "http://localhost:11434"
+  default_model: "OmniNode/Orion:V1.1"
+  auto_check_updates: true
+  check_interval: 3600  # seconds
+
+models:
+  # Available Orion versions to download
+  available:
+    - name: "OmniNode/Orion:V1.1"
+      version: "1.1"
+      description: "Latest stable release"
+      size: "4.1 GB"
+      latest: true
+
+    - name: "OmniNode/Orion:V1.0"
+      version: "1.0"
+      description: "Initial release"
+      size: "4.1 GB"
+      latest: false
+
+  # Other recommended models
+  recommended:
+    - name: "mistral:7b"
+      description: "Base Mistral 7B"
+      size: "4.1 GB"
+
+    - name: "llama3:8b"
+      description: "Meta LLaMA 3 8B"
+      size: "4.7 GB"
+
+    - name: "codellama:7b"
+      description: "Code LLaMA 7B"
+      size: "3.8 GB"
+
+    - name: "phi3:mini"
+      description: "Microsoft Phi-3 Mini"
+      size: "2.3 GB"
+
+ui:
+  theme: "dark"
+  accent_color: "#6c63ff"
+  font: "Inter"
+  mono_font: "JetBrains Mono"
+
+ollama_install:
+  linux:
+    method: "curl"
+    command: "curl -fsSL https://ollama.com/install.sh | sh"
+  
+  windows:
+    method: "download"
+    url: "https://ollama.com/download/OllamaSetup.exe"
+  
+  macos:
+    method: "download"
+    url: "https://ollama.com/download/Ollama-darwin.zip"
+    brew: "brew install ollama"
