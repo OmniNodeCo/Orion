@@ -17,24 +17,536 @@ on:
         default: 'false'
         type: boolean
 
+  # Auto check every 6 hours
+  schedule:
+    - cron: '0 */6 * * *'
+
 permissions:
   contents: write
 
 env:
   PYTHON_VERSION: '3.11'
   APP_NAME: 'OrionGUI'
+  OLLAMA_MODEL: 'OmniNode/Orion'
 
 jobs:
+  # ==========================================
+  # CHECK FOR UPDATES
+  # ==========================================
+  check-updates:
+    name: 🔍 Check for Updates
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      latest_version: ${{ steps.check.outputs.latest_version }}
+      ollama_updated: ${{ steps.check.outputs.ollama_updated }}
+      config_updated: ${{ steps.check.outputs.config_updated }}
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install Dependencies
+        run: pip install requests pyyaml
+
+      - name: 🔍 Check Ollama & GitHub Versions
+        id: check
+        run: |
+          python << 'PYEOF'
+          import requests
+          import json
+          import yaml
+          import os
+          import sys
+
+          GITHUB_OUTPUT = os.environ.get("GITHUB_OUTPUT", "")
+          REPO = os.environ.get("GITHUB_REPOSITORY", "")
+          OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "OmniNode/Orion")
+          EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
+          INPUT_VERSION = "${{ github.event.inputs.version }}"
+          REF_NAME = "${{ github.ref_name }}"
+
+          def write_output(key, value):
+              with open(GITHUB_OUTPUT, "a") as f:
+                  f.write(f"{key}={value}\n")
+
+          # ==========================================
+          # 1. Check Ollama for latest model info
+          # ==========================================
+          print("=" * 50)
+          print("🔍 Checking Ollama Registry...")
+          print("=" * 50)
+
+          ollama_info = {}
+          ollama_updated = False
+
+          try:
+              # Check Ollama API for model info
+              response = requests.get(
+                  f"https://ollama.com/api/tags/{OLLAMA_MODEL}",
+                  timeout=15,
+                  headers={"Accept": "application/json"}
+              )
+
+              if response.status_code == 200:
+                  data = response.json()
+                  print(f"✅ Ollama model found: {OLLAMA_MODEL}")
+                  print(f"   Tags: {json.dumps(data, indent=2)[:500]}")
+                  ollama_info = data
+              else:
+                  print(f"⚠️ Ollama API returned {response.status_code}")
+
+                  # Try alternative endpoint
+                  response2 = requests.get(
+                      f"https://ollama.com/v2/{OLLAMA_MODEL}/tags/list",
+                      timeout=15
+                  )
+                  if response2.status_code == 200:
+                      data = response2.json()
+                      print(f"✅ Ollama tags found: {json.dumps(data, indent=2)[:500]}")
+                      ollama_info = data
+
+          except Exception as e:
+              print(f"⚠️ Could not reach Ollama registry: {e}")
+
+          # ==========================================
+          # 2. Check GitHub for latest release
+          # ==========================================
+          print("\n" + "=" * 50)
+          print("🔍 Checking GitHub Releases...")
+          print("=" * 50)
+
+          github_latest = ""
+          github_releases = []
+
+          try:
+              response = requests.get(
+                  f"https://api.github.com/repos/{REPO}/releases",
+                  timeout=15,
+                  headers={"Accept": "application/vnd.github.v3+json"}
+              )
+
+              if response.status_code == 200:
+                  releases = response.json()
+                  if releases:
+                      github_releases = releases
+                      github_latest = releases[0].get("tag_name", "")
+                      print(f"✅ Latest GitHub release: {github_latest}")
+                      print(f"   Total releases: {len(releases)}")
+
+                      for r in releases[:5]:
+                          print(f"   - {r['tag_name']} ({r['published_at'][:10]})")
+                  else:
+                      print("⚠️ No releases found")
+              else:
+                  print(f"⚠️ GitHub API returned {response.status_code}")
+
+          except Exception as e:
+              print(f"⚠️ Could not check GitHub releases: {e}")
+
+          # ==========================================
+          # 3. Check config.yml for current version
+          # ==========================================
+          print("\n" + "=" * 50)
+          print("🔍 Checking config.yml...")
+          print("=" * 50)
+
+          config_version = ""
+          config_updated = False
+
+          try:
+              if os.path.exists("config.yml"):
+                  with open("config.yml", "r") as f:
+                      config = yaml.safe_load(f)
+                  config_version = config.get("app", {}).get("version", "")
+                  print(f"✅ Config version: {config_version}")
+
+                  # Check available models in config
+                  available = config.get("models", {}).get("available", [])
+                  print(f"   Available models: {len(available)}")
+                  for m in available:
+                      print(f"   - {m.get('name', '')} (v{m.get('version', '')})")
+              else:
+                  print("⚠️ config.yml not found")
+          except Exception as e:
+              print(f"⚠️ Error reading config: {e}")
+
+          # ==========================================
+          # 4. Check if repo config changed recently
+          # ==========================================
+          print("\n" + "=" * 50)
+          print("🔍 Checking recent commits...")
+          print("=" * 50)
+
+          try:
+              response = requests.get(
+                  f"https://api.github.com/repos/{REPO}/commits",
+                  timeout=15,
+                  params={"per_page": 5},
+                  headers={"Accept": "application/vnd.github.v3+json"}
+              )
+
+              if response.status_code == 200:
+                  commits = response.json()
+                  for c in commits[:5]:
+                      msg = c.get("commit", {}).get("message", "")[:80]
+                      sha = c.get("sha", "")[:7]
+                      print(f"   {sha} - {msg}")
+
+                      # Check if config files were changed
+                      if any(keyword in msg.lower() for keyword in ["config", "version", "update", "bump"]):
+                          config_updated = True
+                          print(f"   ⚡ Config-related commit detected!")
+
+          except Exception as e:
+              print(f"⚠️ Could not check commits: {e}")
+
+          # ==========================================
+          # 5. Determine if build should run
+          # ==========================================
+          print("\n" + "=" * 50)
+          print("📊 Build Decision")
+          print("=" * 50)
+
+          should_build = False
+          latest_version = INPUT_VERSION or REF_NAME or config_version or "1.1.0"
+
+          # Manual trigger or tag push = always build
+          if EVENT_NAME in ["workflow_dispatch", "push"]:
+              should_build = True
+              print(f"✅ Manual trigger or tag push - BUILDING")
+
+          # Scheduled check
+          elif EVENT_NAME == "schedule":
+              if config_updated:
+                  should_build = True
+                  print(f"✅ Config updated - BUILDING")
+              elif github_latest != f"v{config_version}" and config_version:
+                  should_build = True
+                  print(f"✅ Version mismatch (GitHub: {github_latest}, Config: {config_version}) - BUILDING")
+              else:
+                  should_build = False
+                  print(f"⏭️ No changes detected - SKIPPING BUILD")
+
+          print(f"\n📌 Should build: {should_build}")
+          print(f"📌 Latest version: {latest_version}")
+          print(f"📌 Ollama updated: {ollama_updated}")
+          print(f"📌 Config updated: {config_updated}")
+
+          write_output("should_build", str(should_build).lower())
+          write_output("latest_version", latest_version)
+          write_output("ollama_updated", str(ollama_updated).lower())
+          write_output("config_updated", str(config_updated).lower())
+
+          PYEOF
+
+      - name: 📊 Summary
+        run: |
+          echo "## 🔍 Update Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Should Build | \`${{ steps.check.outputs.should_build }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ steps.check.outputs.latest_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ollama Updated | \`${{ steps.check.outputs.ollama_updated }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Config Updated | \`${{ steps.check.outputs.config_updated }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================
+  # UPDATE CONFIG FROM OLLAMA
+  # ==========================================
+  update-config:
+    name: 📝 Update Config
+    needs: [check-updates]
+    if: needs.check-updates.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install Dependencies
+        run: pip install requests pyyaml
+
+      - name: 📝 Fetch Latest Ollama Info & Update Config
+        run: |
+          python << 'PYEOF'
+          import requests
+          import yaml
+          import json
+          import os
+
+          OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "OmniNode/Orion")
+          VERSION = "${{ needs.check-updates.outputs.latest_version }}"
+
+          print("📝 Updating config.yml with latest info...")
+
+          # Fetch Ollama model tags
+          ollama_tags = []
+          try:
+              # Try to get available tags
+              response = requests.get(
+                  f"https://registry.ollama.ai/v2/library/{OLLAMA_MODEL.split('/')[-1]}/tags/list",
+                  timeout=15
+              )
+              if response.status_code == 200:
+                  data = response.json()
+                  ollama_tags = data.get("tags", [])
+                  print(f"✅ Found Ollama tags: {ollama_tags}")
+          except Exception as e:
+              print(f"⚠️ Could not fetch Ollama tags: {e}")
+
+          # Fetch latest Ollama version
+          ollama_version = ""
+          try:
+              response = requests.get(
+                  "https://api.github.com/repos/ollama/ollama/releases/latest",
+                  timeout=15,
+                  headers={"Accept": "application/vnd.github.v3+json"}
+              )
+              if response.status_code == 200:
+                  data = response.json()
+                  ollama_version = data.get("tag_name", "")
+                  print(f"✅ Latest Ollama version: {ollama_version}")
+          except Exception as e:
+              print(f"⚠️ Could not fetch Ollama version: {e}")
+
+          # Build available models list from tags
+          available_models = []
+          if ollama_tags:
+              for i, tag in enumerate(ollama_tags):
+                  available_models.append({
+                      "name": f"{OLLAMA_MODEL}:{tag}",
+                      "version": tag.replace("V", "").replace("v", ""),
+                      "description": "Latest release" if i == 0 else f"Version {tag}",
+                      "size": "4.1 GB",
+                      "latest": i == 0
+                  })
+          else:
+              # Default if can't fetch
+              available_models = [
+                  {
+                      "name": f"{OLLAMA_MODEL}:V1.1",
+                      "version": "1.1",
+                      "description": "Latest stable release",
+                      "size": "4.1 GB",
+                      "latest": True
+                  },
+                  {
+                      "name": f"{OLLAMA_MODEL}:V1.0",
+                      "version": "1.0",
+                      "description": "Initial release",
+                      "size": "4.1 GB",
+                      "latest": False
+                  }
+              ]
+
+          # Build config
+          config = {
+              "app": {
+                  "name": "Orion GUI",
+                  "version": VERSION,
+                  "author": "OmniNode",
+                  "description": "GUI for Orion AI running on Ollama",
+                  "port": 5000,
+                  "debug": False
+              },
+              "ollama": {
+                  "url": "http://localhost:11434",
+                  "default_model": f"{OLLAMA_MODEL}:V1.1",
+                  "auto_check_updates": True,
+                  "check_interval": 3600,
+                  "latest_ollama_version": ollama_version
+              },
+              "models": {
+                  "available": available_models,
+                  "recommended": [
+                      {"name": "mistral:7b", "description": "Base Mistral 7B", "size": "4.1 GB"},
+                      {"name": "llama3:8b", "description": "Meta LLaMA 3 8B", "size": "4.7 GB"},
+                      {"name": "codellama:7b", "description": "Code LLaMA 7B", "size": "3.8 GB"},
+                      {"name": "phi3:mini", "description": "Microsoft Phi-3 Mini", "size": "2.3 GB"},
+                      {"name": "gemma2:2b", "description": "Google Gemma 2 2B", "size": "1.6 GB"},
+                      {"name": "qwen2:7b", "description": "Alibaba Qwen 2 7B", "size": "4.4 GB"}
+                  ]
+              },
+              "ollama_install": {
+                  "linux": {
+                      "method": "curl",
+                      "command": "curl -fsSL https://ollama.com/install.sh | sh"
+                  },
+                  "windows": {
+                      "method": "download",
+                      "url": "https://ollama.com/download/OllamaSetup.exe"
+                  },
+                  "macos": {
+                      "method": "brew",
+                      "brew": "brew install ollama",
+                      "url": "https://ollama.com/download/Ollama-darwin.zip"
+                  }
+              },
+              "update_check": {
+                  "github_repo": os.environ.get("GITHUB_REPOSITORY", ""),
+                  "ollama_model": OLLAMA_MODEL,
+                  "auto_update": True
+              }
+          }
+
+          # Write config
+          with open("config.yml", "w") as f:
+              yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+          print("\n✅ config.yml updated!")
+          print(yaml.dump(config, default_flow_style=False)[:1000])
+
+          PYEOF
+
+      - name: 📝 Create install_ollama.py
+        run: |
+          cat > install_ollama.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """Ollama Installer for Orion GUI"""
+          import platform, subprocess, sys, os, time
+          try:
+              import urllib.request
+          except ImportError:
+              pass
+
+          class OllamaInstaller:
+              def __init__(self):
+                  self.system = platform.system().lower()
+                  self.arch = platform.machine().lower()
+
+              def is_installed(self):
+                  try:
+                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
+                      if result.returncode == 0:
+                          print(f"✅ Ollama installed: {result.stdout.strip()}")
+                          return True
+                  except:
+                      pass
+                  print("❌ Ollama not installed")
+                  return False
+
+              def is_running(self):
+                  try:
+                      import requests
+                      r = requests.get("http://localhost:11434/api/tags", timeout=5)
+                      return r.status_code == 200
+                  except:
+                      return False
+
+              def install(self):
+                  print(f"\n📦 Installing Ollama for {self.system}...")
+                  try:
+                      if self.system == "linux":
+                          subprocess.run(["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"])
+                      elif self.system == "darwin":
+                          try:
+                              subprocess.run(["brew", "install", "ollama"])
+                          except FileNotFoundError:
+                              url = "https://ollama.com/download/Ollama-darwin.zip"
+                              path = "/tmp/Ollama-darwin.zip"
+                              urllib.request.urlretrieve(url, path)
+                              subprocess.run(["unzip", "-o", path, "-d", "/Applications/"])
+                      elif self.system == "windows":
+                          url = "https://ollama.com/download/OllamaSetup.exe"
+                          path = os.path.join(os.environ.get("TEMP", "."), "OllamaSetup.exe")
+                          urllib.request.urlretrieve(url, path)
+                          subprocess.Popen([path], shell=True)
+                          print(f"📌 Installer: {path}")
+                  except Exception as e:
+                      print(f"❌ Install failed: {e}")
+                      print("Install manually: https://ollama.com/download")
+
+              def start(self):
+                  if self.is_running():
+                      print("✅ Ollama already running")
+                      return
+                  print("🚀 Starting Ollama...")
+                  try:
+                      if self.system == "windows":
+                          subprocess.Popen(["ollama", "serve"], creationflags=0x00000008,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      else:
+                          subprocess.Popen(["ollama", "serve"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                      for i in range(15):
+                          time.sleep(1)
+                          if self.is_running():
+                              print("✅ Ollama started!")
+                              return
+                          print(f"  Waiting... ({i+1}s)")
+                  except Exception as e:
+                      print(f"⚠️ {e}")
+
+              def pull(self, model):
+                  print(f"\n📥 Pulling {model}...")
+                  subprocess.run(["ollama", "pull", model])
+
+          if __name__ == "__main__":
+              i = OllamaInstaller()
+              print("\n╔══════════════════════════════════╗")
+              print("║    ORION GUI - Ollama Setup      ║")
+              print("╚══════════════════════════════════╝\n")
+              print("1. Install Ollama")
+              print("2. Start Ollama")
+              print("3. Pull Orion Model")
+              print("4. Full Setup (Install + Pull)")
+              print("5. Check Status")
+              print("6. Exit\n")
+              c = input("Choice (1-6): ").strip()
+              if c == "1": i.install()
+              elif c == "2": i.start()
+              elif c == "3": i.pull("OmniNode/Orion:V1.1")
+              elif c == "4":
+                  if not i.is_installed(): i.install()
+                  i.start()
+                  time.sleep(3)
+                  i.pull("OmniNode/Orion:V1.1")
+              elif c == "5":
+                  i.is_installed()
+                  print(f"Running: {i.is_running()}")
+              elif c == "6": sys.exit(0)
+          PYEOF
+
+      - name: 📤 Upload Config Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-config
+          path: |
+            config.yml
+            install_ollama.py
+          retention-days: 1
+
   # ==========================================
   # BUILD FOR LINUX
   # ==========================================
   build-linux:
     name: 🐧 Build Linux
+    needs: [check-updates, update-config]
+    if: needs.check-updates.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
+
+      - name: 📥 Download Generated Config
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-config
+          path: .
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -48,126 +560,17 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 📝 Create config.yml if missing
+      - name: 📋 Verify All Files
         run: |
-          if [ ! -f config.yml ]; then
-            cat > config.yml << 'EOF'
-          app:
-            name: "Orion GUI"
-            version: "${{ github.event.inputs.version || github.ref_name }}"
-            author: "OmniNode"
-            port: 5000
-            debug: false
-
-          ollama:
-            url: "http://localhost:11434"
-            default_model: "OmniNode/Orion:V1.1"
-            auto_check_updates: true
-
-          models:
-            available:
-              - name: "OmniNode/Orion:V1.1"
-                version: "1.1"
-                description: "Latest stable release"
-                size: "4.1 GB"
-                latest: true
-              - name: "OmniNode/Orion:V1.0"
-                version: "1.0"
-                description: "Initial release"
-                size: "4.1 GB"
-                latest: false
-            recommended:
-              - name: "mistral:7b"
-                description: "Base Mistral 7B"
-                size: "4.1 GB"
-              - name: "llama3:8b"
-                description: "Meta LLaMA 3 8B"
-                size: "4.7 GB"
-              - name: "codellama:7b"
-                description: "Code LLaMA 7B"
-                size: "3.8 GB"
-              - name: "phi3:mini"
-                description: "Microsoft Phi-3 Mini"
-                size: "2.3 GB"
-
-          ollama_install:
-            linux:
-              command: "curl -fsSL https://ollama.com/install.sh | sh"
-            windows:
-              url: "https://ollama.com/download/OllamaSetup.exe"
-            macos:
-              brew: "brew install ollama"
-              url: "https://ollama.com/download/Ollama-darwin.zip"
-          EOF
-            echo "✅ config.yml created"
-          else
-            echo "✅ config.yml already exists"
-          fi
-
-      - name: 📝 Create install_ollama.py if missing
-        run: |
-          if [ ! -f install_ollama.py ]; then
-            cat > install_ollama.py << 'PYEOF'
-          #!/usr/bin/env python3
-          import platform, subprocess, sys, os, urllib.request, time
-
-          class OllamaInstaller:
-              def __init__(self):
-                  self.system = platform.system().lower()
-
-              def is_installed(self):
-                  try:
-                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
-                      return result.returncode == 0
-                  except:
-                      return False
-
-              def install(self):
-                  print(f"Installing Ollama for {self.system}...")
-                  if self.system == "linux":
-                      subprocess.run(["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"])
-                  elif self.system == "darwin":
-                      subprocess.run(["brew", "install", "ollama"])
-                  elif self.system == "windows":
-                      url = "https://ollama.com/download/OllamaSetup.exe"
-                      path = os.path.join(os.environ.get("TEMP", "."), "OllamaSetup.exe")
-                      urllib.request.urlretrieve(url, path)
-                      subprocess.Popen([path], shell=True)
-                      print(f"Installer downloaded: {path}")
-
-              def start(self):
-                  try:
-                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                      time.sleep(3)
-                      print("Ollama server started")
-                  except Exception as e:
-                      print(f"Error: {e}")
-
-          if __name__ == "__main__":
-              installer = OllamaInstaller()
-              if not installer.is_installed():
-                  installer.install()
-              installer.start()
-          PYEOF
-            echo "✅ install_ollama.py created"
-          else
-            echo "✅ install_ollama.py already exists"
-          fi
-
-      - name: 📋 Verify Files Exist
-        run: |
-          echo "📁 Files in workspace:"
+          echo "📁 Workspace files:"
           ls -la
           echo ""
-          echo "📁 Templates:"
-          ls -la templates/ || echo "⚠️ No templates folder"
-          echo ""
-          echo "📁 Static:"
-          ls -la static/ || echo "⚠️ No static folder"
-          echo ""
-          echo "✅ config.yml exists: $(test -f config.yml && echo YES || echo NO)"
-          echo "✅ install_ollama.py exists: $(test -f install_ollama.py && echo YES || echo NO)"
-          echo "✅ app.py exists: $(test -f app.py && echo YES || echo NO)"
+          for f in app.py config.yml install_ollama.py requirements.txt; do
+            echo "$f: $(test -f $f && echo '✅' || echo '❌')"
+          done
+          for d in templates static; do
+            echo "$d/: $(test -d $d && echo '✅' || echo '❌')"
+          done
 
       - name: 🔨 Build Linux Executable
         run: |
@@ -193,7 +596,7 @@ jobs:
 
       - name: 📁 Create Release Package
         run: |
-          VERSION=${{ github.event.inputs.version || github.ref_name }}
+          VERSION=${{ needs.check-updates.outputs.latest_version }}
           mkdir -p release/OrionGUI-Linux
           cp dist/${{ env.APP_NAME }}-Linux release/OrionGUI-Linux/
           cp install_ollama.py release/OrionGUI-Linux/
@@ -215,11 +618,19 @@ jobs:
   # ==========================================
   build-windows:
     name: 🪟 Build Windows
+    needs: [check-updates, update-config]
+    if: needs.check-updates.outputs.should_build == 'true'
     runs-on: windows-latest
 
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
+
+      - name: 📥 Download Generated Config
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-config
+          path: .
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -233,105 +644,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 📝 Create config.yml if missing
+      - name: 📋 Verify All Files
         shell: pwsh
         run: |
-          if (-not (Test-Path "config.yml")) {
-            @"
-          app:
-            name: "Orion GUI"
-            version: "${{ github.event.inputs.version || github.ref_name }}"
-            author: "OmniNode"
-            port: 5000
-            debug: false
-
-          ollama:
-            url: "http://localhost:11434"
-            default_model: "OmniNode/Orion:V1.1"
-            auto_check_updates: true
-
-          models:
-            available:
-              - name: "OmniNode/Orion:V1.1"
-                version: "1.1"
-                description: "Latest stable release"
-                size: "4.1 GB"
-                latest: true
-              - name: "OmniNode/Orion:V1.0"
-                version: "1.0"
-                description: "Initial release"
-                size: "4.1 GB"
-                latest: false
-            recommended:
-              - name: "mistral:7b"
-                description: "Base Mistral 7B"
-                size: "4.1 GB"
-              - name: "llama3:8b"
-                description: "Meta LLaMA 3 8B"
-                size: "4.7 GB"
-
-          ollama_install:
-            windows:
-              url: "https://ollama.com/download/OllamaSetup.exe"
-          "@ | Out-File -FilePath "config.yml" -Encoding utf8
-            Write-Host "✅ config.yml created"
-          } else {
-            Write-Host "✅ config.yml already exists"
-          }
-
-      - name: 📝 Create install_ollama.py if missing
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "install_ollama.py")) {
-            @"
-          #!/usr/bin/env python3
-          import platform, subprocess, sys, os, urllib.request, time
-
-          class OllamaInstaller:
-              def __init__(self):
-                  self.system = platform.system().lower()
-
-              def is_installed(self):
-                  try:
-                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
-                      return result.returncode == 0
-                  except:
-                      return False
-
-              def install(self):
-                  if self.system == "windows":
-                      url = "https://ollama.com/download/OllamaSetup.exe"
-                      path = os.path.join(os.environ.get("TEMP", "."), "OllamaSetup.exe")
-                      urllib.request.urlretrieve(url, path)
-                      subprocess.Popen([path], shell=True)
-
-              def start(self):
-                  try:
-                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                      time.sleep(3)
-                  except Exception as e:
-                      print(f"Error: {e}")
-
-          if __name__ == "__main__":
-              installer = OllamaInstaller()
-              if not installer.is_installed():
-                  installer.install()
-              installer.start()
-          "@ | Out-File -FilePath "install_ollama.py" -Encoding utf8
-            Write-Host "✅ install_ollama.py created"
-          } else {
-            Write-Host "✅ install_ollama.py already exists"
-          }
-
-      - name: 📋 Verify Files Exist
-        shell: pwsh
-        run: |
-          Write-Host "📁 Files:"
+          Write-Host "📁 Workspace files:"
           Get-ChildItem -Name
           Write-Host ""
-          Write-Host "config.yml exists: $(Test-Path 'config.yml')"
-          Write-Host "install_ollama.py exists: $(Test-Path 'install_ollama.py')"
-          Write-Host "app.py exists: $(Test-Path 'app.py')"
+          foreach ($f in @("app.py", "config.yml", "install_ollama.py", "requirements.txt")) {
+            $exists = Test-Path $f
+            Write-Host "$f : $(if($exists){'✅'}else{'❌'})"
+          }
 
       - name: 🔨 Build Windows Executable
         run: |
@@ -359,7 +681,7 @@ jobs:
       - name: 📁 Create Release Package
         shell: pwsh
         run: |
-          $VERSION = "${{ github.event.inputs.version || github.ref_name }}"
+          $VERSION = "${{ needs.check-updates.outputs.latest_version }}"
           New-Item -ItemType Directory -Force -Path "release\OrionGUI-Windows"
           Copy-Item "dist\${{ env.APP_NAME }}-Windows.exe" "release\OrionGUI-Windows\"
           Copy-Item "install_ollama.py" "release\OrionGUI-Windows\"
@@ -375,15 +697,23 @@ jobs:
           retention-days: 30
 
   # ==========================================
-  # BUILD FOR MACOS (Apple Silicon - ARM)
+  # BUILD FOR MACOS (Apple Silicon)
   # ==========================================
   build-macos-arm:
     name: 🍎 Build macOS (Apple Silicon)
+    needs: [check-updates, update-config]
+    if: needs.check-updates.outputs.should_build == 'true'
     runs-on: macos-14
 
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
+
+      - name: 📥 Download Generated Config
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-config
+          path: .
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -397,104 +727,13 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 📝 Create config.yml if missing
+      - name: 📋 Verify All Files
         run: |
-          if [ ! -f config.yml ]; then
-            cat > config.yml << 'EOF'
-          app:
-            name: "Orion GUI"
-            version: "${{ github.event.inputs.version || github.ref_name }}"
-            author: "OmniNode"
-            port: 5000
-            debug: false
-
-          ollama:
-            url: "http://localhost:11434"
-            default_model: "OmniNode/Orion:V1.1"
-            auto_check_updates: true
-
-          models:
-            available:
-              - name: "OmniNode/Orion:V1.1"
-                version: "1.1"
-                description: "Latest stable release"
-                size: "4.1 GB"
-                latest: true
-              - name: "OmniNode/Orion:V1.0"
-                version: "1.0"
-                description: "Initial release"
-                size: "4.1 GB"
-                latest: false
-            recommended:
-              - name: "mistral:7b"
-                description: "Base Mistral 7B"
-                size: "4.1 GB"
-              - name: "llama3:8b"
-                description: "Meta LLaMA 3 8B"
-                size: "4.7 GB"
-
-          ollama_install:
-            macos:
-              brew: "brew install ollama"
-              url: "https://ollama.com/download/Ollama-darwin.zip"
-          EOF
-            echo "✅ config.yml created"
-          else
-            echo "✅ config.yml already exists"
-          fi
-
-      - name: 📝 Create install_ollama.py if missing
-        run: |
-          if [ ! -f install_ollama.py ]; then
-            cat > install_ollama.py << 'PYEOF'
-          #!/usr/bin/env python3
-          import platform, subprocess, sys, os, urllib.request, time
-
-          class OllamaInstaller:
-              def __init__(self):
-                  self.system = platform.system().lower()
-
-              def is_installed(self):
-                  try:
-                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
-                      return result.returncode == 0
-                  except:
-                      return False
-
-              def install(self):
-                  if self.system == "darwin":
-                      subprocess.run(["brew", "install", "ollama"])
-                  elif self.system == "linux":
-                      subprocess.run(["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"])
-
-              def start(self):
-                  try:
-                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                      time.sleep(3)
-                  except Exception as e:
-                      print(f"Error: {e}")
-
-          if __name__ == "__main__":
-              installer = OllamaInstaller()
-              if not installer.is_installed():
-                  installer.install()
-              installer.start()
-          PYEOF
-            echo "✅ install_ollama.py created"
-          else
-            echo "✅ install_ollama.py already exists"
-          fi
-
-      - name: 📋 Verify Files Exist
-        run: |
-          echo "📁 Files:"
+          echo "📁 Workspace files:"
           ls -la
-          echo ""
-          echo "config.yml: $(test -f config.yml && echo YES || echo NO)"
-          echo "install_ollama.py: $(test -f install_ollama.py && echo YES || echo NO)"
-          echo "app.py: $(test -f app.py && echo YES || echo NO)"
-          echo "templates/: $(test -d templates && echo YES || echo NO)"
-          echo "static/: $(test -d static && echo YES || echo NO)"
+          for f in app.py config.yml install_ollama.py; do
+            echo "$f: $(test -f $f && echo '✅' || echo '❌')"
+          done
 
       - name: 🔨 Build macOS ARM Executable
         run: |
@@ -520,7 +759,7 @@ jobs:
 
       - name: 📁 Create Release Package
         run: |
-          VERSION=${{ github.event.inputs.version || github.ref_name }}
+          VERSION=${{ needs.check-updates.outputs.latest_version }}
           mkdir -p release/OrionGUI-macOS-ARM
           cp dist/${{ env.APP_NAME }}-macOS-ARM release/OrionGUI-macOS-ARM/
           cp install_ollama.py release/OrionGUI-macOS-ARM/
@@ -538,15 +777,23 @@ jobs:
           retention-days: 30
 
   # ==========================================
-  # BUILD FOR MACOS (Intel x86_64)
+  # BUILD FOR MACOS (Intel)
   # ==========================================
   build-macos-intel:
     name: 🍎 Build macOS (Intel)
+    needs: [check-updates, update-config]
+    if: needs.check-updates.outputs.should_build == 'true'
     runs-on: macos-latest
 
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
+
+      - name: 📥 Download Generated Config
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-config
+          path: .
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -560,102 +807,13 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 📝 Create config.yml if missing
+      - name: 📋 Verify All Files
         run: |
-          if [ ! -f config.yml ]; then
-            cat > config.yml << 'EOF'
-          app:
-            name: "Orion GUI"
-            version: "${{ github.event.inputs.version || github.ref_name }}"
-            author: "OmniNode"
-            port: 5000
-            debug: false
-
-          ollama:
-            url: "http://localhost:11434"
-            default_model: "OmniNode/Orion:V1.1"
-            auto_check_updates: true
-
-          models:
-            available:
-              - name: "OmniNode/Orion:V1.1"
-                version: "1.1"
-                description: "Latest stable release"
-                size: "4.1 GB"
-                latest: true
-              - name: "OmniNode/Orion:V1.0"
-                version: "1.0"
-                description: "Initial release"
-                size: "4.1 GB"
-                latest: false
-            recommended:
-              - name: "mistral:7b"
-                description: "Base Mistral 7B"
-                size: "4.1 GB"
-              - name: "llama3:8b"
-                description: "Meta LLaMA 3 8B"
-                size: "4.7 GB"
-
-          ollama_install:
-            macos:
-              brew: "brew install ollama"
-              url: "https://ollama.com/download/Ollama-darwin.zip"
-          EOF
-            echo "✅ config.yml created"
-          else
-            echo "✅ config.yml already exists"
-          fi
-
-      - name: 📝 Create install_ollama.py if missing
-        run: |
-          if [ ! -f install_ollama.py ]; then
-            cat > install_ollama.py << 'PYEOF'
-          #!/usr/bin/env python3
-          import platform, subprocess, sys, os, urllib.request, time
-
-          class OllamaInstaller:
-              def __init__(self):
-                  self.system = platform.system().lower()
-
-              def is_installed(self):
-                  try:
-                      result = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=10)
-                      return result.returncode == 0
-                  except:
-                      return False
-
-              def install(self):
-                  if self.system == "darwin":
-                      subprocess.run(["brew", "install", "ollama"])
-                  elif self.system == "linux":
-                      subprocess.run(["bash", "-c", "curl -fsSL https://ollama.com/install.sh | sh"])
-
-              def start(self):
-                  try:
-                      subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                      time.sleep(3)
-                  except Exception as e:
-                      print(f"Error: {e}")
-
-          if __name__ == "__main__":
-              installer = OllamaInstaller()
-              if not installer.is_installed():
-                  installer.install()
-              installer.start()
-          PYEOF
-            echo "✅ install_ollama.py created"
-          else
-            echo "✅ install_ollama.py already exists"
-          fi
-
-      - name: 📋 Verify Files Exist
-        run: |
-          echo "📁 Files:"
+          echo "📁 Workspace files:"
           ls -la
-          echo ""
-          echo "config.yml: $(test -f config.yml && echo YES || echo NO)"
-          echo "install_ollama.py: $(test -f install_ollama.py && echo YES || echo NO)"
-          echo "app.py: $(test -f app.py && echo YES || echo NO)"
+          for f in app.py config.yml install_ollama.py; do
+            echo "$f: $(test -f $f && echo '✅' || echo '❌')"
+          done
 
       - name: 🔨 Build macOS Intel Executable
         run: |
@@ -681,7 +839,7 @@ jobs:
 
       - name: 📁 Create Release Package
         run: |
-          VERSION=${{ github.event.inputs.version || github.ref_name }}
+          VERSION=${{ needs.check-updates.outputs.latest_version }}
           mkdir -p release/OrionGUI-macOS-Intel
           cp dist/${{ env.APP_NAME }}-macOS-Intel release/OrionGUI-macOS-Intel/
           cp install_ollama.py release/OrionGUI-macOS-Intel/
@@ -703,7 +861,8 @@ jobs:
   # ==========================================
   release:
     name: 🚀 Create Release
-    needs: [build-linux, build-windows, build-macos-arm, build-macos-intel]
+    needs: [check-updates, build-linux, build-windows, build-macos-arm, build-macos-intel]
+    if: needs.check-updates.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -715,11 +874,6 @@ jobs:
         with:
           path: artifacts
 
-      - name: 📋 List All Artifacts
-        run: |
-          echo "📦 Downloaded artifacts:"
-          find artifacts -type f -ls
-
       - name: 📁 Prepare Release Files
         run: |
           mkdir -p release-files
@@ -730,7 +884,7 @@ jobs:
       - name: 🔖 Get Version
         id: version
         run: |
-          VERSION=${{ github.event.inputs.version || github.ref_name }}
+          VERSION=${{ needs.check-updates.outputs.latest_version }}
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: 📝 Generate Release Notes
@@ -739,14 +893,16 @@ jobs:
           cat > changelog.md << EOF
           ## 🚀 Orion GUI ${VERSION}
 
+          > Auto-built with latest Ollama model info
+
           ### ✨ Features
-          - 💬 Full chat GUI with streaming responses
-          - 📦 Model Manager (check/update/delete models)
-          - 🏪 Model Store (download any Ollama model)
+          - 💬 Chat GUI with streaming responses
+          - 📦 Model Manager (check/update/delete)
+          - 🏪 Model Store (download any model)
           - ⚙️ Ollama auto-installer
-          - 🔄 Real-time update checking
+          - 🔄 Auto update checking
           - 📊 Download progress tracking
-          - 📱 Mobile responsive design
+          - 📱 Mobile responsive
 
           ### 📥 Downloads
 
@@ -754,7 +910,7 @@ jobs:
           |----------|-------------|------|
           | 🐧 Linux | x86_64 | \`OrionGUI-Linux-${VERSION}.tar.gz\` |
           | 🪟 Windows | x86_64 | \`OrionGUI-Windows-${VERSION}.zip\` |
-          | 🍎 macOS | Apple Silicon (M1/M2/M3) | \`OrionGUI-macOS-ARM-${VERSION}.tar.gz\` |
+          | 🍎 macOS | Apple Silicon (M1/M2/M3/M4) | \`OrionGUI-macOS-ARM-${VERSION}.tar.gz\` |
           | 🍎 macOS | Intel (x86_64) | \`OrionGUI-macOS-Intel-${VERSION}.tar.gz\` |
 
           ### 🚀 Quick Start
@@ -770,26 +926,11 @@ jobs:
           **Windows:**
           \`\`\`
           1. Extract ZIP
-          2. Double-click OrionGUI-Windows.exe
+          2. Run OrionGUI-Windows.exe
           3. Open http://localhost:5000
           \`\`\`
 
-          ### 🔧 Install Ollama
-
-          **Linux:**
-          \`\`\`bash
-          curl -fsSL https://ollama.com/install.sh | sh
-          \`\`\`
-
-          **macOS:**
-          \`\`\`bash
-          brew install ollama
-          \`\`\`
-
-          **Windows:**
-          Download from https://ollama.com/download
-
-          ### ◉ Pull Orion Model
+          ### ◉ Pull Orion
           \`\`\`bash
           ollama pull OmniNode/Orion:V1.1
           \`\`\`
@@ -810,29 +951,47 @@ jobs:
             release-files/*
           fail_on_unmatched_files: false
           generate_release_notes: true
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ==========================================
-  # VERIFY RELEASE
+  # VERIFY
   # ==========================================
   verify:
     name: ✅ Verify Release
-    needs: [release]
+    needs: [check-updates, release]
+    if: needs.check-updates.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
-      - name: ✅ Print Download Links
+      - name: ✅ Print Results
         run: |
-          VERSION=${{ github.event.inputs.version || github.ref_name }}
+          VERSION=${{ needs.check-updates.outputs.latest_version }}
           REPO=${{ github.repository }}
           echo ""
-          echo "✅ Release created successfully!"
+          echo "✅ Release created: ${VERSION}"
           echo ""
-          echo "📌 Download links:"
-          echo "  🐧 Linux:          https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.tar.gz"
-          echo "  🪟 Windows:        https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-${VERSION}.zip"
-          echo "  🍎 macOS ARM:      https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-ARM-${VERSION}.tar.gz"
-          echo "  🍎 macOS Intel:    https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-Intel-${VERSION}.tar.gz"
+          echo "📌 Downloads:"
+          echo "  🐧 https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.tar.gz"
+          echo "  🪟 https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-${VERSION}.zip"
+          echo "  🍎 https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-ARM-${VERSION}.tar.gz"
+          echo "  🍎 https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-Intel-${VERSION}.tar.gz"
           echo ""
-          echo "🌐 Release page: https://github.com/${REPO}/releases/tag/${VERSION}"
+          echo "🌐 https://github.com/${REPO}/releases/tag/${VERSION}"
+
+      - name: 📊 Summary
+        run: |
+          VERSION=${{ needs.check-updates.outputs.latest_version }}
+          REPO=${{ github.repository }}
+          echo "## ✅ Release Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${VERSION}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Downloads" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐧 Linux | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Linux-${VERSION}.tar.gz) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🪟 Windows | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-Windows-${VERSION}.zip) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🍎 macOS ARM | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-ARM-${VERSION}.tar.gz) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🍎 macOS Intel | [Download](https://github.com/${REPO}/releases/download/${VERSION}/OrionGUI-macOS-Intel-${VERSION}.tar.gz) |" >> $GITHUB_STEP_SUMMARY
