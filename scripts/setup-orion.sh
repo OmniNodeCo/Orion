@@ -269,24 +269,29 @@ download_model() {
 build_model() {
     print_step "Building Orion in Ollama"
 
-    # Go to project root where Modelfile is
     cd "$PROJECT_ROOT"
 
     print_info "Using Modelfile: $MODELFILE_PATH"
     print_info "Model file: $MODEL_DIR/$GGUF_FILE"
 
-    # Update Modelfile to point to correct model path
-    # Create a temp modelfile with correct path
-    TEMP_MODELFILE=$(mktemp)
-    sed "s|FROM .*\.gguf|FROM ./models/$GGUF_FILE|g" "$MODELFILE_PATH" > "$TEMP_MODELFILE"
+    # Create a temp modelfile with the correct absolute path
+    TEMP_MODELFILE=$(mktemp /tmp/Modelfile.XXXXXX)
 
-    print_info "Running: ollama create $MODEL_NAME"
+    # Replace the FROM line with the absolute path to the gguf file
+    sed "s|FROM .*|FROM $MODEL_DIR/$GGUF_FILE|g" "$MODELFILE_PATH" > "$TEMP_MODELFILE"
+
+    print_info "Temp Modelfile contents:"
+    cat "$TEMP_MODELFILE"
+    echo ""
+
+    print_info "Running: ollama create $MODEL_NAME -f $TEMP_MODELFILE"
 
     ollama create "$MODEL_NAME" -f "$TEMP_MODELFILE"
+    BUILD_STATUS=$?
 
     rm -f "$TEMP_MODELFILE"
 
-    if [ $? -eq 0 ]; then
+    if [ $BUILD_STATUS -eq 0 ]; then
         print_success "Orion model created!"
     else
         print_error "Failed to create model."
