@@ -19,6 +19,14 @@ on:
         options:
           - 'true'
           - 'false'
+      clear_cache:
+        description: 'Clear all caches?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: read
@@ -51,18 +59,41 @@ jobs:
           echo "  Model:       ${{ env.MODEL_NAME }}"
           echo "  Version:     ${{ github.event.inputs.version }}"
           echo "  Push Latest: ${{ github.event.inputs.push_latest }}"
-          echo "  Repo:        ${{ github.repository }}"
-          echo "  Branch:      ${{ github.ref_name }}"
+          echo "  Clear Cache: ${{ github.event.inputs.clear_cache }}"
           echo ""
 
       # =============================================
-      # STEP 3: Ensure models directory exists
+      # STEP 3: Prepare directories
       # =============================================
-      - name: 📁 Prepare Models Directory
-        run: mkdir -p models
+      - name: 📁 Prepare Directories
+        run: |
+          mkdir -p models
+          mkdir -p ~/.ollama
 
       # =============================================
-      # STEP 4: Cache GGUF model
+      # STEP 4: Cache Ollama installation
+      # =============================================
+      - name: 💾 Cache Ollama Installation
+        id: cache-ollama
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/ollama
+            /usr/local/lib/ollama
+          key: ollama-install-${{ runner.os }}-v1
+
+      # =============================================
+      # STEP 5: Cache Ollama config and login
+      # =============================================
+      - name: 💾 Cache Ollama Config
+        id: cache-ollama-config
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-config-${{ secrets.OLLAMA_Username }}-v1
+
+      # =============================================
+      # STEP 6: Cache GGUF model
       # =============================================
       - name: 💾 Cache GGUF Model
         id: cache-model
@@ -72,117 +103,182 @@ jobs:
           key: gguf-${{ env.GGUF_FILE }}
 
       # =============================================
-      # STEP 5: Show cache status
+      # STEP 7: Clear cache if requested
+      # =============================================
+      - name: 🗑️ Clear Cache if Requested
+        if: ${{ github.event.inputs.clear_cache == 'true' }}
+        run: |
+          echo "Clearing caches..."
+          rm -rf ~/.ollama/*
+          rm -f models/${{ env.GGUF_FILE }}
+          echo "✅ Caches cleared"
+
+      # =============================================
+      # STEP 8: Show cache status
       # =============================================
       - name: 📊 Cache Status
         run: |
-          echo "Cache hit: ${{ steps.cache-model.outputs.cache-hit }}"
+          echo "Ollama install cached: ${{ steps.cache-ollama.outputs.cache-hit }}"
+          echo "Ollama config cached:  ${{ steps.cache-ollama-config.outputs.cache-hit }}"
+          echo "Model cached:          ${{ steps.cache-model.outputs.cache-hit }}"
+          echo ""
+          
+          if [ -f "/usr/local/bin/ollama" ]; then
+            echo "✅ Ollama binary found in cache"
+          else
+            echo "⬇️ Ollama will be installed"
+          fi
+          
           if [ -f "models/${{ env.GGUF_FILE }}" ]; then
             FILE_SIZE=$(du -sh "models/${{ env.GGUF_FILE }}" | cut -f1)
-            echo "✅ Cached model found! Size: $FILE_SIZE"
+            echo "✅ Model found in cache! Size: $FILE_SIZE"
           else
-            echo "⬇️ No cache. Model will be downloaded."
+            echo "⬇️ Model will be downloaded"
+          fi
+          
+          if [ -f ~/.ollama/id_ed25519 ] || [ -f ~/.ollama/config.json ]; then
+            echo "✅ Ollama login cached"
+          else
+            echo "🔐 Will need to login"
           fi
 
       # =============================================
-      # STEP 6: Install expect for interactive login
+      # STEP 9: Install Ollama (skip if cached)
       # =============================================
-      - name: 📦 Install Dependencies
+      - name: 📦 Install Ollama
+        if: steps.cache-ollama.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y expect
-          echo "✅ expect installed"
+          echo "Installing Ollama..."
+          curl -fsSL https://ollama.com/install.sh | sh
+          echo "✅ Ollama installed"
 
       # =============================================
-      # STEP 7: Make setup script executable
+      # STEP 10: Start Ollama service
       # =============================================
-      - name: 🔧 Make Script Executable
-        run: chmod +x scripts/setup-orion.sh
-
-      # =============================================
-      # STEP 8: Run setup script
-      # =============================================
-      - name: 🚀 Run Setup Script
-        run: ./scripts/setup-orion.sh
-
-      # =============================================
-      # STEP 9: Verify model exists locally
-      # =============================================
-      - name: ✅ Verify Model Built
+      - name: ▶️ Start Ollama Service
         run: |
-          echo "Installed models:"
+          ollama serve &
+          sleep 5
+          for i in {1..15}; do
+            if curl -s http://localhost:11434 > /dev/null; then
+              echo "✅ Ollama is running"
+              break
+            fi
+            echo "Waiting for Ollama... ($i/15)"
+            sleep 2
+          done
+
+      # =============================================
+      # STEP 11: Download model (skip if cached)
+      # =============================================
+      - name: ⬇️ Download Model
+        if: steps.cache-model.outputs.cache-hit != 'true' && github.event.inputs.clear_cache != 'true'
+        run: |
+          echo "Downloading model..."
+          curl -L \
+            --progress-bar \
+            -C - \
+            --retry 5 \
+            --retry-delay 5 \
+            -o "models/${{ env.GGUF_FILE }}" \
+            "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/${{ env.GGUF_FILE }}"
+          
+          FILE_SIZE=$(du -sh "models/${{ env.GGUF_FILE }}" | cut -f1)
+          echo "✅ Downloaded! Size: $FILE_SIZE"
+
+      # =============================================
+      # STEP 12: Build model
+      # =============================================
+      - name: 🏗️ Build Orion Model
+        run: |
+          echo "Building Orion..."
+          
+          GGUF_PATH="$(pwd)/models/${{ env.GGUF_FILE }}"
+          TEMP_MODELFILE=$(mktemp /tmp/Modelfile.XXXXXX)
+          
+          sed "s|FROM .*|FROM $GGUF_PATH|g" Modelfile > "$TEMP_MODELFILE"
+          
+          echo "--- Modelfile ---"
+          cat "$TEMP_MODELFILE"
+          echo "--- End ---"
+          
+          ollama create ${{ env.MODEL_NAME }} -f "$TEMP_MODELFILE"
+          rm -f "$TEMP_MODELFILE"
+          
+          echo "✅ Model built!"
+
+      # =============================================
+      # STEP 13: Verify model
+      # =============================================
+      - name: ✅ Verify Model
+        run: |
+          echo "Models:"
           ollama list
           echo ""
           if ollama list | grep -qi "^${{ env.MODEL_NAME }}"; then
-            echo "✅ Model ${{ env.MODEL_NAME }} verified!"
+            echo "✅ Orion verified!"
           else
-            echo "❌ Model ${{ env.MODEL_NAME }} not found!"
+            echo "❌ Orion not found!"
             exit 1
           fi
 
-           # =============================================
-      # STEP 10: Login to Ollama Registry
       # =============================================
-      - name: 🔐 Login to Ollama Registry
+      # STEP 14: Setup Ollama credentials
+      # =============================================
+      - name: 🔐 Setup Ollama Credentials
         env:
-          OLLAMA_USER: ${{ secrets.OLLAMA_Username }}
-          OLLAMA_PASS: ${{ secrets.OLLAMA_Pass }}
+          OLLAMA_KEY: ${{ secrets.OLLAMA_KEY }}
         run: |
-          expect << 'EOF'
-          set timeout 30
-          spawn ollama login
-          expect {
-            "Username:" {
-              send "$env(OLLAMA_USER)\r"
-              exp_continue
-            }
-            "Password:" {
-              send "$env(OLLAMA_PASS)\r"
-              exp_continue
-            }
-            "success" { puts "✅ Login successful!" }
-            "Success" { puts "✅ Login successful!" }
-            "logged in" { puts "✅ Login successful!" }
-            "error" { puts "❌ Login failed!"; exit 1 }
-            "Error" { puts "❌ Login failed!"; exit 1 }
-            eof { puts "Login process completed" }
-          }
-          EOF
+          # Check if already logged in
+          if [ -f ~/.ollama/id_ed25519 ]; then
+            echo "✅ Using cached login credentials"
+          else
+            echo "Setting up Ollama credentials..."
+            
+            # Create config directory
+            mkdir -p ~/.ollama
+            
+            # Store the key
+            echo "$OLLAMA_KEY" > ~/.ollama/id_ed25519
+            chmod 600 ~/.ollama/id_ed25519
+            
+            echo "✅ Credentials configured"
+          fi
 
       # =============================================
-      # STEP 11: Push versioned model
+      # STEP 15: Push versioned model
       # =============================================
       - name: 📤 Push Versioned Model
         env:
           USERNAME: ${{ secrets.OLLAMA_Username }}
           VERSION: ${{ github.event.inputs.version }}
         run: |
-          echo "Copying model to ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+          echo "Copying to ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
           ollama cp "${{ env.MODEL_NAME }}" "${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
-
-          echo "Pushing ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+          
+          echo "Pushing..."
           ollama push "${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
-
+          
           echo "✅ Pushed: ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
 
       # =============================================
-      # STEP 12: Optionally push as latest
+      # STEP 16: Push latest (optional)
       # =============================================
       - name: 📤 Push Latest
         if: ${{ github.event.inputs.push_latest == 'true' }}
         env:
           USERNAME: ${{ secrets.OLLAMA_Username }}
         run: |
-          echo "Copying model to ${USERNAME}/${{ env.MODEL_NAME }}:latest"
+          echo "Copying to ${USERNAME}/${{ env.MODEL_NAME }}:latest"
           ollama cp "${{ env.MODEL_NAME }}" "${USERNAME}/${{ env.MODEL_NAME }}:latest"
-
-          echo "Pushing ${USERNAME}/${{ env.MODEL_NAME }}:latest"
+          
+          echo "Pushing..."
           ollama push "${USERNAME}/${{ env.MODEL_NAME }}:latest"
-
+          
           echo "✅ Pushed: ${USERNAME}/${{ env.MODEL_NAME }}:latest"
 
       # =============================================
-      # STEP 13: Summary
+      # STEP 17: Summary
       # =============================================
       - name: 🎉 Done
         env:
@@ -194,8 +290,8 @@ jobs:
           echo "║       🎉 ORION PUSHED SUCCESSFULLY!           ║"
           echo "╚═══════════════════════════════════════════════╝"
           echo ""
-          echo "  Version:  ${VERSION}"
-          echo "  Model:    https://ollama.com/${USERNAME}/${{ env.MODEL_NAME }}"
+          echo "  Version: ${VERSION}"
+          echo "  URL:     https://ollama.com/${USERNAME}/${{ env.MODEL_NAME }}"
           echo ""
           echo "  Pull:"
           echo "    ollama pull ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
@@ -205,7 +301,7 @@ jobs:
           echo ""
 
       # =============================================
-      # STEP 14: GitHub Actions Summary
+      # STEP 18: GitHub Summary
       # =============================================
       - name: 📝 Step Summary
         env:
@@ -219,10 +315,12 @@ jobs:
             echo "|------|-------|"
             echo "| Model | ${{ env.MODEL_NAME }} |"
             echo "| Version | ${VERSION} |"
-            echo "| Cache | ${{ steps.cache-model.outputs.cache-hit }} |"
-            echo "| Registry | https://ollama.com/${USERNAME}/${{ env.MODEL_NAME }} |"
+            echo "| Ollama Cached | ${{ steps.cache-ollama.outputs.cache-hit }} |"
+            echo "| Config Cached | ${{ steps.cache-ollama-config.outputs.cache-hit }} |"
+            echo "| Model Cached | ${{ steps.cache-model.outputs.cache-hit }} |"
+            echo "| URL | https://ollama.com/${USERNAME}/${{ env.MODEL_NAME }} |"
             echo ""
-            echo "### Pull & Run"
+            echo "### Commands"
             echo '```bash'
             echo "ollama pull ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
             echo "ollama run ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
