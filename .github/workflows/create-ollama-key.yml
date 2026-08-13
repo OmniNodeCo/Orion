@@ -1,0 +1,89 @@
+name: 🔑 Print Ollama Public Key
+
+# Generates an Ed25519 keypair for pushing to ollama.com.
+#
+# `ollama push` authenticates with an Ed25519 signature, NOT an API key.
+# API keys from ollama.com/settings/keys only work for inference against
+# ollama.com/api -- they cannot publish models.
+#
+# This workflow prints the PUBLIC key (safe to show) and puts the PRIVATE key
+# in an encrypted artifact for you to store in the OLLAMA_KEY secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "generate" to confirm'
+        required: true
+        default: 'generate'
+      passphrase:
+        description: 'Passphrase used to encrypt the downloadable private key'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  keygen:
+    if: ${{ github.event.inputs.confirm == 'generate' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🔑 Generate Keypair
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # No passphrase on the key itself: the Ollama daemon must read it
+          # unattended. It is protected in transit by the openssl layer below.
+          ssh-keygen -t ed25519 -N "" -C "orion-ci" -f out/id_ed25519 >/dev/null
+          echo "✅ Keypair generated"
+
+      - name: 🔐 Encrypt Private Key
+        env:
+          PASSPHRASE: ${{ github.event.inputs.passphrase }}
+        run: |
+          set -euo pipefail
+          openssl enc -aes-256-cbc -pbkdf2 -salt \
+            -in out/id_ed25519 -out out/id_ed25519.enc \
+            -pass env:PASSPHRASE
+          rm -f out/id_ed25519
+          echo "✅ Private key encrypted"
+
+      - name: 📤 Upload Encrypted Key
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-private-key
+          path: out/id_ed25519.enc
+          retention-days: 1
+
+      - name: 📝 Instructions
+        run: |
+          {
+            echo "## 🔑 Ollama Push Key"
+            echo ""
+            echo "### 1. Register this public key"
+            echo "Add it at <https://ollama.com/settings/keys>:"
+            echo ""
+            echo '```'
+            cat out/id_ed25519.pub
+            echo '```'
+            echo ""
+            echo "### 2. Download the private key"
+            echo "Grab the **ollama-private-key** artifact from this run, then:"
+            echo ""
+            echo '```bash'
+            echo "openssl enc -d -aes-256-cbc -pbkdf2 -in id_ed25519.enc -out id_ed25519"
+            echo '```'
+            echo ""
+            echo "### 3. Store it as a secret"
+            echo "Copy the **entire** decrypted file, including the"
+            echo "\`-----BEGIN OPENSSH PRIVATE KEY-----\` and \`-----END...\` lines,"
+            echo "into a repo secret named **OLLAMA_KEY**."
+            echo ""
+            echo "### 4. Run the build"
+            echo "Run **🤖 Orion AI - Build and Push**."
+            echo ""
+            echo "---"
+            echo "> An ollama.com **API key** will not work here. The registry"
+            echo "> only accepts Ed25519 signatures for publishing models."
+          } >> "$GITHUB_STEP_SUMMARY"
