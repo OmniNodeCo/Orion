@@ -8,46 +8,39 @@ on:
         required: true
         default: 'run'
       version:
-        description: 'Version tag (e.g., 1.0.0, latest, beta)'
+        description: 'Version tag (example: 1.0.0, beta, latest)'
         required: true
-        default: 'latest'
+        default: '1.0.0'
       push_latest:
-        description: 'Also push as "latest"?'
+        description: 'Also push as latest?'
         required: true
         default: 'true'
         type: choice
         options:
           - 'true'
           - 'false'
-      clear_cache:
-        description: 'Force re-download model?'
-        required: true
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+
+permissions:
+  contents: read
 
 jobs:
   build-and-push:
-    name: Build and Push Orion v${{ github.event.inputs.version }}
+    if: ${{ github.event.inputs.confirm == 'run' }}
     runs-on: ubuntu-latest
 
     env:
       MODEL_NAME: orion
-      VERSION: ${{ github.event.inputs.version }}
       GGUF_FILE: Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
-      HF_URL: https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
 
     steps:
       # =============================================
-      # STEP 1: Checkout Repository
+      # STEP 1: Checkout repo
       # =============================================
       - name: 📂 Checkout Repository
         uses: actions/checkout@v4
 
       # =============================================
-      # STEP 2: Print Build Info
+      # STEP 2: Show build info
       # =============================================
       - name: 📋 Build Info
         run: |
@@ -55,240 +48,197 @@ jobs:
           echo "║           ORION AI - BUILD INFO           ║"
           echo "╚═══════════════════════════════════════════╝"
           echo ""
-          echo "  Model:        ${{ env.MODEL_NAME }}"
-          echo "  Version:      ${{ env.VERSION }}"
-          echo "  User:         ${{ secrets.OLLAMA_Username }}"
-          echo "  Push Latest:  ${{ github.event.inputs.push_latest }}"
-          echo "  Clear Cache:  ${{ github.event.inputs.clear_cache }}"
-          echo "  Commit:       ${{ github.sha }}"
-          echo "  Branch:       ${{ github.ref_name }}"
+          echo "  Model:       ${{ env.MODEL_NAME }}"
+          echo "  Version:     ${{ github.event.inputs.version }}"
+          echo "  Push Latest: ${{ github.event.inputs.push_latest }}"
+          echo "  Repo:        ${{ github.repository }}"
+          echo "  Branch:      ${{ github.ref_name }}"
           echo ""
 
       # =============================================
-      # STEP 3: Cache Model File
+      # STEP 3: Ensure models directory exists
       # =============================================
-      - name: 💾 Cache Model File
+      - name: 📁 Prepare Models Directory
+        run: mkdir -p models
+
+      # =============================================
+      # STEP 4: Cache GGUF model
+      # =============================================
+      - name: 💾 Cache GGUF Model
         id: cache-model
         uses: actions/cache@v4
         with:
           path: models/${{ env.GGUF_FILE }}
           key: gguf-${{ env.GGUF_FILE }}
-          restore-keys: |
-            gguf-
 
       # =============================================
-      # STEP 4: Cache Ollama Data
-      # =============================================
-      - name: 💾 Cache Ollama Data
-        id: cache-ollama
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.ollama
-            /usr/local/bin/ollama
-          key: ollama-install-${{ runner.os }}
-          restore-keys: |
-            ollama-install-
-
-      # =============================================
-      # STEP 5: Check Cache Status
+      # STEP 5: Show cache status
       # =============================================
       - name: 📊 Cache Status
         run: |
-          echo "Model cache hit: ${{ steps.cache-model.outputs.cache-hit }}"
-          echo "Ollama cache hit: ${{ steps.cache-ollama.outputs.cache-hit }}"
-          
+          echo "Cache hit: ${{ steps.cache-model.outputs.cache-hit }}"
           if [ -f "models/${{ env.GGUF_FILE }}" ]; then
             FILE_SIZE=$(du -sh "models/${{ env.GGUF_FILE }}" | cut -f1)
-            echo "✅ Model file found in cache! Size: $FILE_SIZE"
+            echo "✅ Cached model found! Size: $FILE_SIZE"
           else
-            echo "⬇️  Model will be downloaded"
+            echo "⬇️ No cache. Model will be downloaded."
           fi
 
       # =============================================
-      # STEP 6: Clear Cache if Requested
+      # STEP 6: Install expect for interactive login
       # =============================================
-      - name: 🗑️ Clear Cache if Requested
-        if: ${{ github.event.inputs.clear_cache == 'true' }}
+      - name: 📦 Install Dependencies
         run: |
-          echo "Clearing cached model..."
-          rm -f models/${{ env.GGUF_FILE }}
-          echo "✅ Cache cleared. Model will be re-downloaded."
+          sudo apt-get update
+          sudo apt-get install -y expect
+          echo "✅ expect installed"
 
       # =============================================
-      # STEP 7: Install Ollama
+      # STEP 7: Make setup script executable
       # =============================================
-      - name: 📦 Install Ollama
-        if: steps.cache-ollama.outputs.cache-hit != 'true'
-        run: |
-          echo "Installing Ollama..."
-          curl -fsSL https://ollama.com/install.sh | sh
-          echo "✅ Ollama installed"
+      - name: 🔧 Make Script Executable
+        run: chmod +x scripts/setup-orion.sh
 
       # =============================================
-      # STEP 8: Start Ollama Service
+      # STEP 8: Run setup script
       # =============================================
-      - name: ▶️ Start Ollama Service
-        run: |
-          ollama serve &
-          sleep 5
-          for i in {1..15}; do
-            if curl -s http://localhost:11434 > /dev/null; then
-              echo "✅ Ollama is running"
-              break
-            fi
-            echo "Waiting for Ollama... ($i/15)"
-            sleep 2
-          done
+      - name: 🚀 Run Setup Script
+        run: ./scripts/setup-orion.sh
 
       # =============================================
-      # STEP 9: Download Model (if not cached)
-      # =============================================
-      - name: ⬇️ Download Model
-        if: steps.cache-model.outputs.cache-hit != 'true' || github.event.inputs.clear_cache == 'true'
-        run: |
-          mkdir -p models
-          echo "Downloading model from Hugging Face..."
-          echo "This may take a while (~4.1GB)..."
-          
-          curl -L \
-            --progress-bar \
-            -C - \
-            --retry 5 \
-            --retry-delay 5 \
-            -o "models/${{ env.GGUF_FILE }}" \
-            "${{ env.HF_URL }}"
-          
-          FILE_SIZE=$(du -sh "models/${{ env.GGUF_FILE }}" | cut -f1)
-          echo "✅ Download complete! Size: $FILE_SIZE"
-
-      # =============================================
-      # STEP 10: Skip Download (if cached)
-      # =============================================
-      - name: ⚡ Using Cached Model
-        if: steps.cache-model.outputs.cache-hit == 'true' && github.event.inputs.clear_cache != 'true'
-        run: |
-          FILE_SIZE=$(du -sh "models/${{ env.GGUF_FILE }}" | cut -f1)
-          echo "⚡ Using cached model! Size: $FILE_SIZE"
-          echo "⏱️  Saved ~10 minutes of download time"
-
-      # =============================================
-      # STEP 11: Build Model in Ollama
-      # =============================================
-      - name: 🏗️ Build Orion in Ollama
-        run: |
-          echo "Building Orion from Modelfile..."
-          
-          # Create temp modelfile with absolute path
-          GGUF_PATH="$(pwd)/models/${{ env.GGUF_FILE }}"
-          TEMP_MODELFILE=$(mktemp /tmp/Modelfile.XXXXXX)
-          
-          sed "s|FROM .*|FROM $GGUF_PATH|g" Modelfile > "$TEMP_MODELFILE"
-          
-          echo "--- Modelfile Contents ---"
-          cat "$TEMP_MODELFILE"
-          echo "--- End Modelfile ---"
-          echo ""
-          
-          ollama create ${{ env.MODEL_NAME }} -f "$TEMP_MODELFILE"
-          
-          rm -f "$TEMP_MODELFILE"
-          
-          echo "✅ Orion model built!"
-
-      # =============================================
-      # STEP 12: Verify Model Built
+      # STEP 9: Verify model exists locally
       # =============================================
       - name: ✅ Verify Model Built
         run: |
-          echo "Listing all models:"
+          echo "Installed models:"
           ollama list
           echo ""
-          
-          if ollama list | grep -q "${{ env.MODEL_NAME }}"; then
-            echo "✅ Orion model verified!"
+          if ollama list | grep -qi "^${{ env.MODEL_NAME }}"; then
+            echo "✅ Model ${{ env.MODEL_NAME }} verified!"
           else
-            echo "❌ Model not found!"
+            echo "❌ Model ${{ env.MODEL_NAME }} not found!"
             exit 1
           fi
 
       # =============================================
-      # STEP 13: Login to Ollama Registry
+      # STEP 10: Login to Ollama Registry (using expect)
       # =============================================
       - name: 🔐 Login to Ollama Registry
+        env:
+          OLLAMA_USER: ${{ secrets.OLLAMA_Username }}
+          OLLAMA_PASS: ${{ secrets.OLLAMA_Pass }}
         run: |
-          echo "${{ secrets.API_OLLAMA }}" | ollama login \
-            --username "${{ secrets.OLLAMA_Username }}" \
-            --password-stdin ollama.com
+          expect << 'EOF'
+          set timeout 30
+          spawn ollama login ollama.com
+          expect {
+            "Username:" {
+              send "$env(OLLAMA_USER)\r"
+              exp_continue
+            }
+            "Password:" {
+              send "$env(OLLAMA_PASS)\r"
+              exp_continue
+            }
+            "success" {
+              puts "✅ Login successful!"
+            }
+            "Success" {
+              puts "✅ Login successful!"
+            }
+            "logged in" {
+              puts "✅ Login successful!"
+            }
+            "error" {
+              puts "❌ Login failed!"
+              exit 1
+            }
+            "Error" {
+              puts "❌ Login failed!"
+              exit 1
+            }
+            eof {
+              puts "Login process completed"
+            }
+          }
+          EOF
 
       # =============================================
-      # STEP 14: Push Versioned Model
+      # STEP 11: Push versioned model
       # =============================================
-      - name: 📤 Push Orion v${{ env.VERSION }}
+      - name: 📤 Push Versioned Model
+        env:
+          USERNAME: ${{ secrets.OLLAMA_Username }}
+          VERSION: ${{ github.event.inputs.version }}
         run: |
-          echo "Tagging with version: ${{ env.VERSION }}"
-          
-          ollama cp ${{ env.MODEL_NAME }} \
-            ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:${{ env.VERSION }}
-          
-          ollama push \
-            ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:${{ env.VERSION }}
-          
-          echo "✅ Pushed: ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:${{ env.VERSION }}"
+          echo "Copying model to ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+          ollama cp "${{ env.MODEL_NAME }}" "${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+
+          echo "Pushing ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+          ollama push "${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+
+          echo "✅ Pushed: ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
 
       # =============================================
-      # STEP 15: Push as Latest (if selected)
+      # STEP 12: Optionally push as latest
       # =============================================
-      - name: 📤 Push as Latest
+      - name: 📤 Push Latest
         if: ${{ github.event.inputs.push_latest == 'true' }}
+        env:
+          USERNAME: ${{ secrets.OLLAMA_Username }}
         run: |
-          echo "Also pushing as latest..."
-          
-          ollama cp ${{ env.MODEL_NAME }} \
-            ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:latest
-          
-          ollama push \
-            ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:latest
-          
-          echo "✅ Pushed: ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:latest"
+          echo "Copying model to ${USERNAME}/${{ env.MODEL_NAME }}:latest"
+          ollama cp "${{ env.MODEL_NAME }}" "${USERNAME}/${{ env.MODEL_NAME }}:latest"
+
+          echo "Pushing ${USERNAME}/${{ env.MODEL_NAME }}:latest"
+          ollama push "${USERNAME}/${{ env.MODEL_NAME }}:latest"
+
+          echo "✅ Pushed: ${USERNAME}/${{ env.MODEL_NAME }}:latest"
 
       # =============================================
-      # STEP 16: Create Git Tag
-      # =============================================
-      - name: 🏷️ Create Git Tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git tag -a "v${{ env.VERSION }}" \
-            -m "Orion v${{ env.VERSION }} - Built and pushed to Ollama" || true
-          git push origin "v${{ env.VERSION }}" || echo "Tag already exists, skipping..."
-
-      # =============================================
-      # STEP 17: Build Summary
+      # STEP 13: Summary
       # =============================================
       - name: 🎉 Done
+        env:
+          USERNAME: ${{ secrets.OLLAMA_Username }}
+          VERSION: ${{ github.event.inputs.version }}
         run: |
           echo ""
           echo "╔═══════════════════════════════════════════════╗"
           echo "║       🎉 ORION PUSHED SUCCESSFULLY!           ║"
-          echo "╠═══════════════════════════════════════════════╣"
-          echo "║                                               ║"
-          echo "║  Version:  ${{ env.VERSION }}                         ║"
-          echo "║  Git Tag:  v${{ env.VERSION }}                        ║"
-          echo "║  Cache:    ${{ steps.cache-model.outputs.cache-hit }}                        ║"
-          echo "║                                               ║"
           echo "╚═══════════════════════════════════════════════╝"
           echo ""
-          echo "  Your model is live at:"
-          echo "    https://ollama.com/${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}"
+          echo "  Version:  ${VERSION}"
+          echo "  Model:    https://ollama.com/${USERNAME}/${{ env.MODEL_NAME }}"
           echo ""
-          echo "  Pull specific version:"
-          echo "    ollama pull ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:${{ env.VERSION }}"
+          echo "  Pull:"
+          echo "    ollama pull ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
           echo ""
-          echo "  Pull latest:"
-          echo "    ollama pull ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:latest"
+          echo "  Run:"
+          echo "    ollama run ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
           echo ""
-          echo "  Run it:"
-          echo "    ollama run ${{ secrets.OLLAMA_Username }}/${{ env.MODEL_NAME }}:${{ env.VERSION }}"
-          echo ""
+
+      # =============================================
+      # STEP 14: GitHub Actions Summary
+      # =============================================
+      - name: 📝 Step Summary
+        env:
+          USERNAME: ${{ secrets.OLLAMA_Username }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          {
+            echo "## 🤖 Orion Build Complete"
+            echo ""
+            echo "| Info | Value |"
+            echo "|------|-------|"
+            echo "| Model | ${{ env.MODEL_NAME }} |"
+            echo "| Version | ${VERSION} |"
+            echo "| Cache | ${{ steps.cache-model.outputs.cache-hit }} |"
+            echo "| Registry | https://ollama.com/${USERNAME}/${{ env.MODEL_NAME }} |"
+            echo ""
+            echo "### Pull & Run"
+            echo '```bash'
+            echo "ollama pull ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+            echo "ollama run ${USERNAME}/${{ env.MODEL_NAME }}:${VERSION}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
