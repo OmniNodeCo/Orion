@@ -1,0 +1,34 @@
+name: 🤖 Orion AI - Full Setup
+
+on:
+  # Run manually from GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "run" to confirm setup'
+        required: true
+        default: 'run'
+
+jobs:
+  setup-orion:
+    name: Setup Orion AI
+    runs-on: ubuntu-latest
+
+    steps:
+      # =============================================
+      # STEP 1: Checkout Repository
+      # =============================================
+      - name: 📂 Checkout Repository
+        uses: actions/checkout@v4
+
+      # =============================================
+      # STEP 2: Make Script Executable
+      # =============================================
+      - name: 🔧 Make Script Executable
+        run: chmod +x scripts/setup-orion.sh
+
+      # =============================================
+      # STEP 3: Run Setup Script
+      # =============================================
+      - name: 🚀 Run Orion Setup Script
+        run: ./scripts/setup-orion.sh
