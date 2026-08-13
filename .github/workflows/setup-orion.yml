@@ -120,8 +120,8 @@ jobs:
             exit 1
           fi
 
-      # =============================================
-      # STEP 10: Login to Ollama Registry (using expect)
+           # =============================================
+      # STEP 10: Login to Ollama Registry
       # =============================================
       - name: 🔐 Login to Ollama Registry
         env:
@@ -130,7 +130,7 @@ jobs:
         run: |
           expect << 'EOF'
           set timeout 30
-          spawn ollama login ollama.com
+          spawn ollama login
           expect {
             "Username:" {
               send "$env(OLLAMA_USER)\r"
@@ -140,26 +140,12 @@ jobs:
               send "$env(OLLAMA_PASS)\r"
               exp_continue
             }
-            "success" {
-              puts "✅ Login successful!"
-            }
-            "Success" {
-              puts "✅ Login successful!"
-            }
-            "logged in" {
-              puts "✅ Login successful!"
-            }
-            "error" {
-              puts "❌ Login failed!"
-              exit 1
-            }
-            "Error" {
-              puts "❌ Login failed!"
-              exit 1
-            }
-            eof {
-              puts "Login process completed"
-            }
+            "success" { puts "✅ Login successful!" }
+            "Success" { puts "✅ Login successful!" }
+            "logged in" { puts "✅ Login successful!" }
+            "error" { puts "❌ Login failed!"; exit 1 }
+            "Error" { puts "❌ Login failed!"; exit 1 }
+            eof { puts "Login process completed" }
           }
           EOF
 
