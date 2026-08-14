@@ -16,13 +16,17 @@ on:
         required: true
         default: 'true'
         type: choice
-        options: ['true', 'false']
+        options:
+          - 'true'
+          - 'false'
       clear_cache:
         description: 'Clear the cached GGUF download?'
         required: true
         default: 'false'
         type: choice
-        options: ['false', 'true']
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: read
@@ -36,12 +40,20 @@ jobs:
       MODEL_NAME: orion
       GGUF_FILE: Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
       GGUF_URL: https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
+      # The daemon we control, running as the runner user, so ~/.ollama is the key it uses.
       OLLAMA_HOST: 127.0.0.1:11434
 
     steps:
+      # =============================================
+      # STEP 1: Checkout
+      # =============================================
       - name: 📂 Checkout Repository
         uses: actions/checkout@v4
 
+      # =============================================
+      # STEP 2: Free up disk space
+      # A 7B Q4 GGUF plus the imported Ollama blob needs ~10GB.
+      # =============================================
       - name: 🧹 Free Disk Space
         run: |
           set -euo pipefail
@@ -50,96 +62,179 @@ jobs:
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
           echo "After:"; df -h / | tail -1
 
+      # =============================================
+      # STEP 3: Install Ollama
+      # =============================================
       - name: 📦 Install Ollama
         run: |
           set -euo pipefail
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version || true
 
+      # =============================================
+      # STEP 4: Install signing key  (THE ACTUAL FIX)
+      #
+      # `ollama push` does NOT authenticate with an API key. The registry uses
+      # an Ed25519 challenge/response: the *server* signs with the private key
+      # at $HOME/.ollama/id_ed25519 (auth.Sign -> ssh.ParsePrivateKey).
+      # OLLAMA_API_KEY only works for inference against ollama.com/api.
+      #
+      # So the secret must hold the PRIVATE KEY, and the daemon must run as the
+      # user that owns that key -- not the systemd `ollama` user, whose home is
+      # /usr/share/ollama and which would silently use a different key.
+      # =============================================
       - name: 🔐 Install Ollama Signing Key
         env:
+          # Primary secret. Accepts the raw Ed25519 private key, or a base64
+          # blob of it, in UTF-8 or UTF-16, with LF or CRLF line endings.
           OLLAMA_KEY: ${{ secrets.OLLAMA_KEY }}
+          # Alternate name, checked only if OLLAMA_KEY is unset.
           OLLAMA_PRIVATE_KEY: ${{ secrets.OLLAMA_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+
+          # Stop the systemd daemon: it runs as user `ollama` (home
+          # /usr/share/ollama) and would sign with the wrong key.
           sudo systemctl stop ollama 2>/dev/null || true
           sudo systemctl disable ollama 2>/dev/null || true
+
           mkdir -p ~/.ollama
+          WORK="$(mktemp -d)"
 
-          KEY=""; SRC=""
-          for NAME in OLLAMA_KEY OLLAMA_PRIVATE_KEY; do
-            VAL="$(eval "printf '%s' \"\${$NAME:-}\"")"
-            if [ -n "$VAL" ]; then KEY="$VAL"; SRC="$NAME"; break; fi
-          done
+          # Write the secret straight to a file. Never use $(...) on key
+          # material: command substitution silently drops null bytes, which
+          # corrupts UTF-16 input and hides the real problem.
+          SRC=""
+          if [ -n "${OLLAMA_KEY:-}" ]; then
+            SRC=OLLAMA_KEY;         printf '%s' "$OLLAMA_KEY"         > "$WORK/raw"
+          elif [ -n "${OLLAMA_PRIVATE_KEY:-}" ]; then
+            SRC=OLLAMA_PRIVATE_KEY; printf '%s' "$OLLAMA_PRIVATE_KEY" > "$WORK/raw"
+          fi
 
-          if [ -z "$KEY" ]; then
+          if [ -z "$SRC" ] || [ ! -s "$WORK/raw" ]; then
             echo "::error::Secret OLLAMA_KEY is empty or not set."
+            echo "::error::It must contain the CONTENTS of ~/.ollama/id_ed25519."
+            echo "::error::Run the '🔑 Print Ollama Public Key' workflow to generate one."
             exit 1
           fi
-          echo "Using secret: $SRC"
+          echo "Using secret: $SRC ($(wc -c < "$WORK/raw") bytes)"
 
-          if ! printf '%s' "$KEY" | grep -q "OPENSSH PRIVATE KEY"; then
-            DECODED="$(printf '%s' "$KEY" | tr -d '[:space:]' | base64 -d 2>/dev/null || true)"
-            if printf '%s' "$DECODED" | grep -q "OPENSSH PRIVATE KEY"; then
-              echo "Detected base64-encoded key; decoding."
-              KEY="$DECODED"
+          # Strip UTF-16 null padding and CRLF line endings.
+          normalize() { tr -d '\000' < "$1" | sed -e 's/\r$//' > "$2"; }
+
+          cp "$WORK/raw" "$WORK/cand"
+
+          # Transparently peel off a base64 layer if there is one.
+          if ! grep -q "OPENSSH PRIVATE KEY" "$WORK/cand"; then
+            tr -d '[:space:]' < "$WORK/raw" | base64 -d > "$WORK/dec" 2>/dev/null || true
+            if [ -s "$WORK/dec" ]; then
+              normalize "$WORK/dec" "$WORK/dec.n"
+              if grep -q "OPENSSH PRIVATE KEY" "$WORK/dec.n"; then
+                echo "Detected base64-encoded key; decoded."
+                cp "$WORK/dec.n" "$WORK/cand"
+              fi
             fi
           fi
 
-          if ! printf '%s' "$KEY" | grep -q "OPENSSH PRIVATE KEY"; then
-            echo "::error::Secret '$SRC' does not contain an Ed25519 private key."
-            echo "::error::API keys CANNOT publish models. Value must start with"
-            echo "::error::-----BEGIN OPENSSH PRIVATE KEY-----"
+          normalize "$WORK/cand" "$WORK/key"
+
+          if ! grep -q "OPENSSH PRIVATE KEY" "$WORK/key"; then
+            echo "::error::Secret '$SRC' does not contain an Ed25519 PRIVATE key."
+            if grep -q "^ssh-ed25519 " "$WORK/key" \
+               || head -c 32 "$WORK/dec" 2>/dev/null | grep -qa "ssh-ed25519"; then
+              echo "::error::This is the PUBLIC key (id_ed25519.pub). The public key goes on"
+              echo "::error::ollama.com; the workflow needs the PRIVATE half to sign pushes."
+              echo "::error::Use the file WITHOUT the .pub extension:  cat ~/.ollama/id_ed25519"
+            else
+              echo "::error::It looks like an ollama.com API key. API keys CANNOT publish models:"
+              echo "::error::the registry authenticates pushes with an Ed25519 signature, while an"
+              echo "::error::API key only works for inference against ollama.com/api."
+              echo "::error::Run '🔑 Print Ollama Public Key' to generate a real signing key."
+            fi
+            echo "::error::The value must start with: -----BEGIN OPENSSH PRIVATE KEY-----"
             exit 1
           fi
 
-          printf '%s\n' "$KEY" | sed -e 's/[[:space:]]*$//' > ~/.ollama/id_ed25519
+          # Keep only the PEM block, and guarantee the trailing newline that
+          # secret boxes tend to eat but PEM parsing requires.
+          awk '/BEGIN OPENSSH PRIVATE KEY/{b=1} b{print} /END OPENSSH PRIVATE KEY/{exit}' \
+            "$WORK/key" > ~/.ollama/id_ed25519
           chmod 600 ~/.ollama/id_ed25519
 
           if ! ssh-keygen -y -f ~/.ollama/id_ed25519 > ~/.ollama/id_ed25519.pub 2>/dev/null; then
-            echo "::error::Key is malformed. Store it base64-encoded instead:"
+            echo "::error::The private key in '$SRC' is malformed and could not be parsed."
+            echo "::error::Copy the file verbatim, including the BEGIN and END lines."
+            echo "::error::If pasting multi-line text is unreliable, store it base64-encoded:"
             echo "::error::  base64 -w0 ~/.ollama/id_ed25519"
             exit 1
           fi
           chmod 644 ~/.ollama/id_ed25519.pub
+          rm -rf "$WORK"
+
           echo "✅ Signing key installed"
+          echo "Public key (must be registered at https://ollama.com/settings/keys):"
           cat ~/.ollama/id_ed25519.pub
 
+      # =============================================
+      # STEP 5: Start the daemon as this user
+      # =============================================
       - name: ▶️ Start Ollama Service
         run: |
           set -euo pipefail
           nohup ollama serve > /tmp/ollama.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf "http://${OLLAMA_HOST}/api/tags" >/dev/null; then
-              echo "✅ Ollama running (as $(whoami), HOME=$HOME)"; exit 0
+              echo "✅ Ollama is running (as $(whoami), HOME=$HOME)"
+              exit 0
             fi
             sleep 2
           done
           echo "::error::Ollama did not start"; cat /tmp/ollama.log; exit 1
 
+      # =============================================
+      # STEP 6: Verify auth BEFORE building
+      #
+      # `ollama push` calls Whoami first and, on 401, prints "You need to be
+      # signed in" and returns nil -> EXIT CODE 0. That is why every run went
+      # green while nothing was ever published. We check /api/me ourselves and
+      # fail loudly instead.
+      # =============================================
       - name: 🪪 Verify Ollama Account
         id: whoami
         run: |
           set -euo pipefail
+
           BODY=$(curl -s -o /tmp/me.json -w '%{http_code}' \
                    -X POST "http://${OLLAMA_HOST}/api/me") || true
           echo "HTTP $BODY"
 
           if [ "$BODY" != "200" ]; then
             echo "::error::Not signed in to ollama.com (HTTP $BODY)."
-            echo "::error::Stopping: 'ollama push' would warn, exit 0, and publish NOTHING."
-            echo "::error::Register this key at https://ollama.com/settings/keys :"
+            echo "::error::Stopping now: 'ollama push' would print a warning, exit 0, and publish NOTHING."
+            echo "::error::The key below is not registered to any ollama.com account."
+            echo "::error::Add it at https://ollama.com/settings/keys and re-run:"
+            echo ""
             cat ~/.ollama/id_ed25519.pub
+            echo ""
             cat /tmp/me.json 2>/dev/null || true
             exit 1
           fi
 
           NS=$(python3 -c "import json;print(json.load(open('/tmp/me.json')).get('name',''))")
-          [ -z "$NS" ] && { echo "::error::No username returned."; exit 1; }
+          if [ -z "$NS" ]; then
+            echo "::error::ollama.com did not return a username."; cat /tmp/me.json; exit 1
+          fi
+
+          # Registry namespaces are lowercase. Deriving it from the signed-in
+          # account (instead of a username secret) means a name with capitals
+          # can no longer produce a dead ollama.com URL.
           NS=$(echo "$NS" | tr '[:upper:]' '[:lower:]')
           echo "namespace=$NS" >> "$GITHUB_OUTPUT"
           echo "✅ Signed in as: $NS"
 
+      # =============================================
+      # STEP 7: Cache + download the GGUF
+      # =============================================
       - name: 💾 Cache GGUF Model
         id: cache-model
         uses: actions/cache@v4
@@ -153,9 +248,14 @@ jobs:
           set -euo pipefail
           mkdir -p models
           [ "${{ github.event.inputs.clear_cache }}" = "true" ] && rm -f "models/${GGUF_FILE}"
-          curl -fL --retry 5 --retry-delay 5 -C - -o "models/${GGUF_FILE}" "${GGUF_URL}"
+
+          curl -fL --retry 5 --retry-delay 5 -C - \
+            -o "models/${GGUF_FILE}" "${GGUF_URL}"
+
+          # A redirect to an HTML error page would otherwise be "downloaded"
+          # happily and only blow up later inside `ollama create`.
           if [ "$(head -c 4 "models/${GGUF_FILE}")" != "GGUF" ]; then
-            echo "::error::Not a GGUF (bad magic bytes)."
+            echo "::error::Downloaded file is not a GGUF (bad magic bytes)."
             head -c 300 "models/${GGUF_FILE}"; exit 1
           fi
           echo "✅ Downloaded $(du -h "models/${GGUF_FILE}" | cut -f1)"
@@ -164,13 +264,17 @@ jobs:
         run: |
           set -euo pipefail
           test -s "models/${GGUF_FILE}" || { echo "::error::GGUF missing"; exit 1; }
-          [ "$(head -c 4 "models/${GGUF_FILE}")" = "GGUF" ] || { echo "::error::Corrupt"; exit 1; }
+          [ "$(head -c 4 "models/${GGUF_FILE}")" = "GGUF" ] || { echo "::error::Cached file is corrupt"; exit 1; }
           echo "✅ $(du -h "models/${GGUF_FILE}" | cut -f1)"
 
+      # =============================================
+      # STEP 8: Build
+      # =============================================
       - name: 🏗️ Build Orion Model
         run: |
           set -euo pipefail
           TMP=$(mktemp /tmp/Modelfile.XXXXXX)
+          # Only rewrite the FROM line; SYSTEM blocks may legally contain "FROM".
           sed "1s|^FROM .*|FROM $(pwd)/models/${GGUF_FILE}|" Modelfile > "$TMP"
           head -1 "$TMP"
           ollama create "${MODEL_NAME}" -f "$TMP"
@@ -183,6 +287,9 @@ jobs:
           ollama show "${MODEL_NAME}" >/dev/null
           echo "✅ Built"
 
+      # =============================================
+      # STEP 9: Push
+      # =============================================
       - name: 📤 Push Versioned Model
         env:
           NS: ${{ steps.whoami.outputs.namespace }}
@@ -191,6 +298,9 @@ jobs:
           set -euo pipefail
           TARGET="${NS}/${MODEL_NAME}:${VERSION}"
           ollama cp "${MODEL_NAME}" "${TARGET}"
+
+          # Tee the output so we can catch the silent "need to be signed in"
+          # path, which exits 0 without uploading anything.
           ollama push "${TARGET}" 2>&1 | tee /tmp/push.log
           if grep -qi "need to be signed in\|not authorized" /tmp/push.log; then
             echo "::error::Push did not happen: not authenticated for ${NS}."
@@ -208,10 +318,14 @@ jobs:
           ollama cp "${MODEL_NAME}" "${TARGET}"
           ollama push "${TARGET}" 2>&1 | tee /tmp/push_latest.log
           if grep -qi "need to be signed in\|not authorized" /tmp/push_latest.log; then
-            echo "::error::Latest push did not happen."; exit 1
+            echo "::error::Latest push did not happen: not authenticated."
+            exit 1
           fi
           echo "✅ Pushed ${TARGET}"
 
+      # =============================================
+      # STEP 10: Prove it is really on the registry
+      # =============================================
       - name: 🔍 Verify Published Model
         id: verify
         env:
@@ -221,18 +335,22 @@ jobs:
           set -euo pipefail
           URL="https://registry.ollama.ai/v2/${NS}/${MODEL_NAME}/manifests/${VERSION}"
           CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL")
-          echo "Manifest -> HTTP $CODE"
+          echo "Manifest $URL -> HTTP $CODE"
+
           if [ "$CODE" != "200" ]; then
             PAGE=$(curl -s -o /dev/null -w '%{http_code}' -L "https://ollama.com/${NS}/${MODEL_NAME}")
             echo "Model page -> HTTP $PAGE"
             if [ "$PAGE" != "200" ]; then
-              echo "::error::Model is NOT on ollama.com. Push reported success but published nothing."
+              echo "::error::Model is NOT on ollama.com. The push reported success but published nothing."
               exit 1
             fi
           fi
           echo "verified=true" >> "$GITHUB_OUTPUT"
           echo "✅ Confirmed live on ollama.com"
 
+      # =============================================
+      # STEP 11: Summary
+      # =============================================
       - name: 📝 Step Summary
         if: always()
         env:
