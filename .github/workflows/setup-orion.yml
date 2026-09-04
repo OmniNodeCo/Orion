@@ -10,7 +10,7 @@ on:
       version:
         description: 'Version tag (example: 1.0.0, beta, latest)'
         required: true
-        default: '1.0.0'
+        default: '1.7.0'
       push_latest:
         description: 'Also push as latest?'
         required: true

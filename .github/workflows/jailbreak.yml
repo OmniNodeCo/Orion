@@ -3,6 +3,8 @@ name: 🛡️ Orion Red Team
 # Attacks the PUBLISHED model on ollama.com with a fixed suite of jailbreak,
 # prompt-leak, injection and over-refusal prompts, then reports what got
 # through. This tests what users actually pull, not what is in the repo.
+# The report is intentionally structured as a scorecard plus collapsible
+# per-finding details so the job summary is readable instead of a raw log dump.
 #
 # Severity model:
 #   error  leaks, missed refusals, over-refusal of legitimate security work,
