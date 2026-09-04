@@ -1,0 +1,263 @@
+name: 🛡️ Orion Red Team
+
+# Attacks the PUBLISHED model on ollama.com with a fixed suite of jailbreak,
+# prompt-leak, injection and over-refusal prompts, then reports what got
+# through. This tests what users actually pull, not what is in the repo.
+#
+# Severity model:
+#   error  leaks, missed refusals, over-refusal of legitimate security work,
+#          integrity regressions -> fails the job
+#   warn   persona/DAN jailbreaks -> reported only, because a 7B model words
+#          refusals inconsistently and those assertions flap
+#
+# Add a PR trigger if you want it on every change:
+#   pull_request:
+#     paths: ['Modelfile', 'tests/**']
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Namespace. "auto" derives it from the signing key via /api/me.'
+        required: true
+        default: 'omninodeco'
+      model:
+        description: 'Model name (without namespace)'
+        required: true
+        default: 'orion'
+      tag:
+        description: 'Tag to attack'
+        required: true
+        default: 'latest'
+      max_tokens:
+        description: 'Max tokens per reply (lower = faster)'
+        required: true
+        default: '200'
+      strictness:
+        description: 'Fail the job on error-severity findings?'
+        required: true
+        default: 'error'
+        type: choice
+        options:
+          - 'error'
+          - 'none'
+  schedule:
+    # Mondays at 04:00 UTC.
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redteam-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  redteam:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      OLLAMA_HOST: 127.0.0.1:11434
+      NS: ${{ github.event.inputs.namespace || 'omninodeco' }}
+      MODEL_NAME: ${{ github.event.inputs.model || 'orion' }}
+      TAG: ${{ github.event.inputs.tag || 'latest' }}
+      MAXTOK: ${{ github.event.inputs.max_tokens || '200' }}
+      STRICT: ${{ github.event.inputs.strictness || 'error' }}
+
+    steps:
+      - name: 📂 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🧹 Free Disk Space
+        run: |
+          set -euo pipefail
+          echo "Before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          echo "After:"; df -h / | tail -1
+
+      - name: 📦 Install Ollama
+        run: |
+          set -euo pipefail
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version || true
+
+      # The systemd unit runs as user `ollama` with HOME=/usr/share/ollama, so
+      # it would sign pulls with the wrong key. Stop it and run our own daemon.
+      - name: ⏹ Stop Systemd Daemon
+        run: |
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo systemctl disable ollama 2>/dev/null || true
+
+      # Optional. Only needed if the model is private on ollama.com -- a public
+      # model pulls anonymously. Reuses the same normalisation as the build
+      # workflow: raw or base64, UTF-8 or UTF-16, LF or CRLF.
+      - name: 🔐 Install Signing Key (optional, for private models)
+        env:
+          OLLAMA_KEY: ${{ secrets.OLLAMA_KEY }}
+          OLLAMA_PRIVATE_KEY: ${{ secrets.OLLAMA_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ollama
+          WORK="$(mktemp -d)"
+          SRC=""
+          if [ -n "${OLLAMA_KEY:-}" ]; then
+            SRC=OLLAMA_KEY;         printf '%s' "$OLLAMA_KEY"         > "$WORK/raw"
+          elif [ -n "${OLLAMA_PRIVATE_KEY:-}" ]; then
+            SRC=OLLAMA_PRIVATE_KEY; printf '%s' "$OLLAMA_PRIVATE_KEY" > "$WORK/raw"
+          fi
+          if [ -z "$SRC" ] || [ ! -s "$WORK/raw" ]; then
+            echo "No signing key secret set. Pulling anonymously (public models only)."
+            rm -rf "$WORK"; exit 0
+          fi
+          tr -d '\000' < "$WORK/raw" | sed -e 's/\r$//' > "$WORK/cand"
+          if ! grep -q "OPENSSH PRIVATE KEY" "$WORK/cand"; then
+            tr -d '[:space:]' < "$WORK/raw" | base64 -d > "$WORK/dec" 2>/dev/null || true
+            if [ -s "$WORK/dec" ] && grep -q "OPENSSH PRIVATE KEY" "$WORK/dec"; then
+              echo "Detected base64-encoded key; decoded."
+              tr -d '\000' < "$WORK/dec" | sed -e 's/\r$//' > "$WORK/cand"
+            fi
+          fi
+          if ! grep -q "OPENSSH PRIVATE KEY" "$WORK/cand"; then
+            echo "::error::Secret '$SRC' is not an Ed25519 private key."
+            echo "::error::Expected a file starting with -----BEGIN OPENSSH PRIVATE KEY-----"
+            exit 1
+          fi
+          awk '/BEGIN OPENSSH PRIVATE KEY/{b=1} b{print} /END OPENSSH PRIVATE KEY/{exit}' \
+            "$WORK/cand" > ~/.ollama/id_ed25519
+          chmod 600 ~/.ollama/id_ed25519
+          ssh-keygen -y -f ~/.ollama/id_ed25519 > ~/.ollama/id_ed25519.pub
+          chmod 644 ~/.ollama/id_ed25519.pub
+          rm -rf "$WORK"
+          echo "✅ Signing key installed"
+
+      - name: ▶️ Start Ollama Service
+        run: |
+          set -euo pipefail
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf "http://${OLLAMA_HOST}/api/tags" >/dev/null; then
+              echo "✅ Ollama is running (as $(whoami), HOME=$HOME)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Ollama did not start"; cat /tmp/ollama.log; exit 1
+
+      - name: 🆔 Resolve Namespace
+        run: |
+          set -euo pipefail
+          if [ "$NS" = "auto" ]; then
+            if [ ! -f ~/.ollama/id_ed25519 ]; then
+              echo "::error::namespace=auto needs the OLLAMA_KEY secret to call /api/me."
+              exit 1
+            fi
+            curl -s -X POST "http://${OLLAMA_HOST}/api/me" -o /tmp/me.json
+            NAME=$(python3 -c "import json;print(json.load(open('/tmp/me.json')).get('name',''))")
+            if [ -z "$NAME" ]; then
+              echo "::error::/api/me returned no name. Is the key registered at ollama.com/settings/keys?"
+              cat /tmp/me.json; exit 1
+            fi
+            NS=$(echo "$NAME" | tr '[:upper:]' '[:lower:]')
+            echo "Resolved namespace from /api/me: $NS"
+          fi
+          echo "NS=$NS" >> "$GITHUB_ENV"
+          echo "TARGET=${NS}/${MODEL_NAME}:${TAG}" >> "$GITHUB_ENV"
+
+      # Fail before spending ten minutes on a pull if the model was never
+      # published. This is the check the build workflow was missing: everything
+      # went green while nothing reached the registry.
+      - name: 🔍 Verify Model Is Published
+        run: |
+          set -euo pipefail
+          PAGE=$(curl -s -o /dev/null -w '%{http_code}' -L "https://ollama.com/${NS}/${MODEL_NAME}")
+          MAN=$(curl -s -o /dev/null -w '%{http_code}' \
+                "https://registry.ollama.ai/v2/${NS}/${MODEL_NAME}/manifests/${TAG}")
+          echo "ollama.com/${NS}/${MODEL_NAME}        -> HTTP $PAGE"
+          echo "registry manifest :${TAG}             -> HTTP $MAN"
+          if [ "$MAN" = "404" ] || [ "$PAGE" = "404" ]; then
+            echo "::error::${NS}/${MODEL_NAME}:${TAG} is not published."
+            echo "::error::Run '🤖 Orion AI - Build and Push' first, or pick a tag that exists."
+            exit 1
+          fi
+          # 401 means the manifest exists but is private, which is fine here as
+          # long as the signing key is installed.
+          if [ "$MAN" = "401" ] && [ ! -f ~/.ollama/id_ed25519 ]; then
+            echo "::error::${NS}/${MODEL_NAME}:${TAG} is private and no signing key is installed."
+            exit 1
+          fi
+          echo "✅ Model exists"
+
+      - name: ⬇️ Pull Published Model
+        run: |
+          set -euo pipefail
+          echo "Pulling ${TARGET}"
+          ollama pull "${TARGET}"
+          ollama list | grep -F "${MODEL_NAME}" || true
+
+      # Guard against testing a stale build. If ollama.com is serving a prompt
+      # older than the Modelfile in the repo, the results describe the wrong
+      # model.
+      - name: 🧬 Compare Published Prompt To Repo Modelfile
+        run: |
+          set -euo pipefail
+          ollama show "${TARGET}" --system > published-system.txt 2>/dev/null || true
+          python3 - <<'PY'
+          import hashlib, re
+
+          pub = open('published-system.txt').read()
+          src = open('Modelfile').read()
+          m = re.search(r'SYSTEM """(.*?)"""', src, re.S)
+          repo = m.group(1) if m else ''
+
+          norm = lambda s: re.sub(r'\s+', ' ', s).strip()
+          h    = lambda s: hashlib.sha256(norm(s).encode()).hexdigest()[:12]
+          ver  = lambda s: (re.search(r'v(\d+\.\d+)', s) or [None, '?'])[1]
+
+          print("published prompt sha:", h(pub), " version:", ver(pub))
+          print("repo Modelfile sha  :", h(repo), " version:", ver(repo))
+          if h(pub) == h(repo):
+              print("✅ The published model matches the Modelfile in this commit.")
+          else:
+              print("::warning::Published prompt differs from the repo Modelfile.")
+              print("::warning::Findings below describe ollama.com, not this commit.")
+          PY
+
+      - name: 🛡️ Run Red Team Suite
+        env:
+          # MODEL is set in the shell below: TARGET only exists as a real env
+          # var, since it is assembled at runtime by the namespace step.
+          SUITE: tests/redteam.json
+          HOST: 127.0.0.1:11434
+          OUTDIR: redteam-out
+        run: |
+          set -euo pipefail
+          export MODEL="${TARGET}"
+          python3 tests/run_redteam.py
+
+      - name: 📊 Write Job Summary
+        if: always()
+        run: |
+          {
+            echo "## 🛡️ Orion Red Team"
+            echo ""
+            echo "Target: \`${TARGET}\`"
+            echo ""
+            if [ -f redteam-out/redteam-summary.md ]; then
+              cat redteam-out/redteam-summary.md
+            else
+              echo "No results file. The suite did not complete."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 📤 Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redteam-results-${{ github.run_number }}
+          path: |
+            redteam-out/redteam-results.json
+            redteam-out/redteam-summary.md
+            published-system.txt
+          retention-days: 30
