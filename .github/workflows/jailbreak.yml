@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       namespace:
-        description: 'Namespace. "auto" derives it from the signing key via /api/me.'
+        description: 'Namespace. "auto" (default) resolves it from the signing key.'
         required: true
-        default: 'omninodeco'
+        default: 'auto'
       model:
         description: 'Model name (without namespace)'
         required: true
@@ -59,7 +59,7 @@ jobs:
 
     env:
       OLLAMA_HOST: 127.0.0.1:11434
-      NS: ${{ github.event.inputs.namespace || 'omninodeco' }}
+      NS: ${{ github.event.inputs.namespace || 'auto' }}
       MODEL_NAME: ${{ github.event.inputs.model || 'orion' }}
       TAG: ${{ github.event.inputs.tag || 'latest' }}
       MAXTOK: ${{ github.event.inputs.max_tokens || '200' }}
@@ -166,18 +166,25 @@ jobs:
             echo "No signing key installed, so the account namespace cannot be resolved."
           fi
 
+          ACCT_NS=""
+          if [ -n "$ACCT" ]; then
+            ACCT_NS=$(echo "$ACCT" | tr '[:upper:]' '[:lower:]')
+          fi
+
           if [ "$NS" = "auto" ]; then
-            if [ -z "$ACCT" ]; then
-              echo "::error::namespace=auto needs the OLLAMA_KEY secret to call /api/me."
-              exit 1
+            if [ -n "$ACCT_NS" ]; then
+              NS="$ACCT_NS"
+              echo "Resolved namespace from /api/me: $NS"
+            else
+              NS="omninodeco"
+              echo "::warning::No signing key, so the namespace cannot be resolved."
+              echo "::warning::Falling back to a guess: '${NS}'. Set the OLLAMA_KEY secret to avoid this."
             fi
-            NS=$(echo "$ACCT" | tr '[:upper:]' '[:lower:]')
-            echo "Resolved namespace from /api/me: $NS"
-          elif [ -n "$ACCT" ] && [ "$NS" != "$(echo "$ACCT" | tr '[:upper:]' '[:lower:]')" ]; then
+          elif [ -n "$ACCT_NS" ] && [ "$NS" != "$ACCT_NS" ]; then
             echo "::warning::Requested namespace '${NS}' but this key belongs to '${ACCT}'."
-            echo "::warning::If the model is yours, it lives under the namespace above."
           fi
           echo "NS=$NS" >> "$GITHUB_ENV"
+          echo "ACCT_NS=$ACCT_NS" >> "$GITHUB_ENV"
           echo "TARGET=${NS}/${MODEL_NAME}:${TAG}" >> "$GITHUB_ENV"
 
       # Fail before spending ten minutes on a pull if the model was never
@@ -186,13 +193,41 @@ jobs:
       - name: 🔍 Verify Model Is Published
         run: |
           set -euo pipefail
-          PAGE=$(curl -s -o /dev/null -w '%{http_code}' -L "https://ollama.com/${NS}/${MODEL_NAME}")
-          MAN=$(curl -s -o /dev/null -w '%{http_code}' \
-                "https://registry.ollama.ai/v2/${NS}/${MODEL_NAME}/manifests/${TAG}")
-          echo "ollama.com/${NS}/${MODEL_NAME}        -> HTTP $PAGE"
-          echo "registry manifest :${TAG}             -> HTTP $MAN"
-          if [ "$MAN" = "404" ] || [ "$PAGE" = "404" ]; then
-            echo "::error::${NS}/${MODEL_NAME}:${TAG} is not published."
+          manifest() {
+            curl -s -o /dev/null -w '%{http_code}' \
+              "https://registry.ollama.ai/v2/$1/${MODEL_NAME}/manifests/${TAG}"
+          }
+          # Called directly rather than in $(...), so MAN and PAGE land in this
+          # shell. Writing them to $GITHUB_ENV would only reach later steps.
+          probe() {
+            NSX="$1"
+            PAGE=$(curl -s -o /dev/null -w '%{http_code}' -L "https://ollama.com/${NSX}/${MODEL_NAME}")
+            MAN=$(manifest "$NSX")
+            echo "ollama.com/${NSX}/${MODEL_NAME}  -> HTTP ${PAGE}"
+            echo "registry manifest :${TAG}        -> HTTP ${MAN}"
+          }
+
+          probe "$NS"
+
+          # A 404 under the requested namespace is usually a wrong namespace
+          # rather than a missing model. If the signing key belongs to a
+          # different account, retry there before declaring it unpublished.
+          if [ "$MAN" != "200" ] && [ "$MAN" != "401" ] \
+             && [ -n "${ACCT_NS:-}" ] && [ "${ACCT_NS}" != "${NS}" ]; then
+            echo ""
+            echo "::warning::Not found under '${NS}'. Retrying with the namespace this key belongs to: '${ACCT_NS}'."
+            NS="${ACCT_NS}"
+            probe "$NS"
+            if [ "$MAN" = "200" ] || [ "$MAN" = "401" ]; then
+              echo ""
+              echo "::warning::Namespace was wrong. Corrected: ${NS}/${MODEL_NAME}:${TAG}"
+              echo "NS=${NS}" >> "$GITHUB_ENV"
+              echo "TARGET=${NS}/${MODEL_NAME}:${TAG}" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          if [ "$MAN" != "200" ] && [ "$MAN" != "401" ]; then
+            echo "::error::${NS}/${MODEL_NAME}:${TAG} is not published (manifest HTTP ${MAN})."
             echo "::error::Run '🤖 Orion AI - Build and Push' first, or pick a tag that exists."
             exit 1
           fi
@@ -202,7 +237,7 @@ jobs:
             echo "::error::${NS}/${MODEL_NAME}:${TAG} is private and no signing key is installed."
             exit 1
           fi
-          echo "✅ Model exists"
+          echo "✅ Model exists at ${NS}/${MODEL_NAME}:${TAG}"
 
       - name: ⬇️ Pull Published Model
         run: |
