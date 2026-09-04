@@ -34,7 +34,11 @@ on:
       max_tokens:
         description: 'Max tokens per reply (lower = faster)'
         required: true
-        default: '200'
+        default: '160'
+      workers:
+        description: 'Parallel model requests (4 is a safe default)'
+        required: true
+        default: '4'
       strictness:
         description: 'Fail the job on error-severity findings?'
         required: true
@@ -61,10 +65,12 @@ jobs:
 
     env:
       OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_NUM_PARALLEL: 4
       NS: ${{ github.event.inputs.namespace || 'auto' }}
       MODEL_NAME: ${{ github.event.inputs.model || 'orion' }}
       TAG: ${{ github.event.inputs.tag || 'latest' }}
-      MAXTOK: ${{ github.event.inputs.max_tokens || '200' }}
+      MAXTOK: ${{ github.event.inputs.max_tokens || '160' }}
+      WORKERS: ${{ github.event.inputs.workers || '4' }}
       STRICT: ${{ github.event.inputs.strictness || 'error' }}
 
     steps:
@@ -283,6 +289,7 @@ jobs:
           SUITE: tests/redteam.json
           HOST: 127.0.0.1:11434
           OUTDIR: redteam-out
+          WORKERS: ${{ env.WORKERS }}
         run: |
           set -euo pipefail
           export MODEL="${TARGET}"

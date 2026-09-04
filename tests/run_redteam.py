@@ -22,8 +22,10 @@ Environment:
     MAXTOK    max tokens per reply, default 200
     STRICT    "error" fails the job on errors, "none" never fails
     OUTDIR    where to write artifacts, default redteam-out
+    WORKERS   concurrent requests, default 4
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -37,6 +39,7 @@ MODEL = os.environ.get("MODEL", "")
 MAXTOK = int(os.environ.get("MAXTOK", "200"))
 STRICT = os.environ.get("STRICT", "error")
 OUTDIR = os.environ.get("OUTDIR", "redteam-out")
+WORKERS = max(1, int(os.environ.get("WORKERS", "4")))
 
 # Things that must never appear in any reply. The first two are regression
 # guards for the admin override and command set that were removed in v1.7 --
@@ -148,44 +151,50 @@ def main():
     with open(SUITE) as fh:
         suite = json.load(fh)
 
-    results = []
-    for i, test in enumerate(suite, 1):
+    def run_one(index, test):
         tid = test["id"]
-        print("[%2d/%d] RUN  %-14s %-14s" %
-              (i, len(suite), tid, test["category"]), flush=True)
         try:
             reply = ask(test["prompt"])
+            problems, notes = evaluate(test, reply)
+            result = {"id": tid, "category": test["category"],
+                      "severity": test.get("severity", "error"),
+                      "problems": problems, "notes": notes, "reply": reply,
+                      "prompt": test["prompt"], "why": test.get("why", ""),
+                      "fix": test.get("fix", "")}
         except urllib.error.HTTPError as exc:
-            problems = ["request failed: HTTP %s" % exc.code]
-            results.append({"id": tid, "category": test["category"],
-                            "severity": test.get("severity", "error"),
-                            "problems": problems, "notes": [], "reply": "",
-                            "prompt": test["prompt"], "why": test.get("why", ""),
-                            "fix": test.get("fix", "")})
-            print("       %-4s %s" % ("FAIL" if test.get("severity") == "error" else "WARN", problems[0]), flush=True)
-            continue
+            result = {"id": tid, "category": test["category"],
+                      "severity": test.get("severity", "error"),
+                      "problems": ["request failed: HTTP %s" % exc.code],
+                      "notes": [], "reply": "", "prompt": test["prompt"],
+                      "why": test.get("why", ""), "fix": test.get("fix", "")}
         except (urllib.error.URLError, TimeoutError, KeyError, ValueError) as exc:
-            problems = ["request failed: %s" % exc]
-            results.append({"id": tid, "category": test["category"],
-                            "severity": test.get("severity", "error"),
-                            "problems": problems, "notes": [], "reply": "",
-                            "prompt": test["prompt"], "why": test.get("why", ""),
-                            "fix": test.get("fix", "")})
-            print("       %-4s %s" % ("FAIL" if test.get("severity") == "error" else "WARN", problems[0]), flush=True)
-            continue
-        problems, notes = evaluate(test, reply)
-        results.append({"id": tid, "category": test["category"],
-                        "severity": test.get("severity", "error"),
-                        "problems": problems, "notes": notes, "reply": reply,
-                        "prompt": test["prompt"],
-                        "why": test.get("why", ""), "fix": test.get("fix", "")})
-        if problems:
-            mark = "FAIL" if test.get("severity", "error") == "error" else "WARN"
-            print("       %-4s %s" % (mark, "; ".join(problems)), flush=True)
-        elif notes:
-            print("       PASS %s" % "; ".join(notes), flush=True)
-        else:
-            print("       PASS", flush=True)
+            result = {"id": tid, "category": test["category"],
+                      "severity": test.get("severity", "error"),
+                      "problems": ["request failed: %s" % exc],
+                      "notes": [], "reply": "", "prompt": test["prompt"],
+                      "why": test.get("why", ""), "fix": test.get("fix", "")}
+        return index, result
+
+    # Ollama can serve independent chat requests concurrently. Keeping the
+    # result list in suite order preserves deterministic reports while the
+    # requests themselves run in parallel, reducing 42 sequential calls to
+    # roughly 11 batches with the default four workers.
+    print("Running %d tests with %d concurrent workers" % (len(suite), WORKERS), flush=True)
+    results = [None] * len(suite)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = [pool.submit(run_one, i, test) for i, test in enumerate(suite)]
+        for future in concurrent.futures.as_completed(futures):
+            i, result = future.result()
+            results[i] = result
+            if result["problems"]:
+                mark = "FAIL" if result["severity"] == "error" else "WARN"
+                detail = "; ".join(result["problems"])
+            elif result.get("notes"):
+                mark, detail = "PASS", "; ".join(result["notes"])
+            else:
+                mark, detail = "PASS", ""
+            print("[%2d/%d] %-4s %-14s %s" %
+                  (i + 1, len(suite), mark, result["id"], detail), flush=True)
 
     os.makedirs(OUTDIR, exist_ok=True)
     with open(os.path.join(OUTDIR, "redteam-results.json"), "w") as fh:
