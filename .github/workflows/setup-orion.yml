@@ -230,6 +230,10 @@ jobs:
           # can no longer produce a dead ollama.com URL.
           NS=$(echo "$NS" | tr '[:upper:]' '[:lower:]')
           echo "namespace=$NS" >> "$GITHUB_OUTPUT"
+          # Also surface it as an annotation: the log line above cannot be read
+          # back from the API, and the namespace is the first thing you need
+          # when a push appears to succeed but the model is nowhere to be found.
+          echo "::warning::Ollama namespace: ${NS} (model will be ${NS}/${MODEL_NAME})"
           echo "✅ Signed in as: $NS"
 
       # =============================================
@@ -336,14 +340,24 @@ jobs:
           URL="https://registry.ollama.ai/v2/${NS}/${MODEL_NAME}/manifests/${VERSION}"
           CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL")
           echo "Manifest $URL -> HTTP $CODE"
+          PAGE=$(curl -s -o /dev/null -w '%{http_code}' -L "https://ollama.com/${NS}/${MODEL_NAME}")
+          echo "Model page -> HTTP $PAGE"
 
-          if [ "$CODE" != "200" ]; then
-            PAGE=$(curl -s -o /dev/null -w '%{http_code}' -L "https://ollama.com/${NS}/${MODEL_NAME}")
-            echo "Model page -> HTTP $PAGE"
-            if [ "$PAGE" != "200" ]; then
-              echo "::error::Model is NOT on ollama.com. The push reported success but published nothing."
-              exit 1
-            fi
+          # 200 = public, 401 = exists but private. Anything else, 404 in
+          # particular, means the push uploaded nothing. Previously a 404
+          # manifest paired with a 200 model page still counted as verified,
+          # which is how a run could go green with no model on the registry.
+          if [ "$CODE" != "200" ] && [ "$CODE" != "401" ]; then
+            echo "::error::Manifest HTTP ${CODE}: ${NS}/${MODEL_NAME}:${VERSION} is NOT on the registry."
+            echo "::error::The push step reported success but uploaded nothing."
+            echo "::error::Check that the public key in ~/.ollama/id_ed25519.pub is registered"
+            echo "::error::at https://ollama.com/settings/keys and that the account owns '${NS}'."
+            exit 1
+          fi
+
+          if [ "$PAGE" != "200" ] && [ "$CODE" = "200" ]; then
+            echo "::warning::Manifest is live but https://ollama.com/${NS}/${MODEL_NAME} returned HTTP ${PAGE}."
+            echo "::warning::The model page can lag the registry by a few minutes."
           fi
           echo "verified=true" >> "$GITHUB_OUTPUT"
           echo "✅ Confirmed live on ollama.com"

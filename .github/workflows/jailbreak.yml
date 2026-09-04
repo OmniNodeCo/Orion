@@ -145,22 +145,37 @@ jobs:
           done
           echo "::error::Ollama did not start"; cat /tmp/ollama.log; exit 1
 
+      # Always probe /api/me when a key is installed, even when an explicit
+      # namespace was requested. The account name is only visible in the log,
+      # which is not readable from outside the runner, so it is also emitted as
+      # a warning annotation where it can be picked up from the checks API.
       - name: 🆔 Resolve Namespace
         run: |
           set -euo pipefail
+          ACCT=""
+          if [ -f ~/.ollama/id_ed25519 ]; then
+            curl -s -X POST "http://${OLLAMA_HOST}/api/me" -o /tmp/me.json
+            ACCT=$(python3 -c "import json;print(json.load(open('/tmp/me.json')).get('name',''))" 2>/dev/null || true)
+            if [ -n "$ACCT" ]; then
+              echo "::warning::Ollama account: ${ACCT} (registry namespace: $(echo "$ACCT" | tr '[:upper:]' '[:lower:]'))"
+            else
+              echo "::warning::Signing key installed but /api/me returned no account name."
+              cat /tmp/me.json 2>/dev/null || true
+            fi
+          else
+            echo "No signing key installed, so the account namespace cannot be resolved."
+          fi
+
           if [ "$NS" = "auto" ]; then
-            if [ ! -f ~/.ollama/id_ed25519 ]; then
+            if [ -z "$ACCT" ]; then
               echo "::error::namespace=auto needs the OLLAMA_KEY secret to call /api/me."
               exit 1
             fi
-            curl -s -X POST "http://${OLLAMA_HOST}/api/me" -o /tmp/me.json
-            NAME=$(python3 -c "import json;print(json.load(open('/tmp/me.json')).get('name',''))")
-            if [ -z "$NAME" ]; then
-              echo "::error::/api/me returned no name. Is the key registered at ollama.com/settings/keys?"
-              cat /tmp/me.json; exit 1
-            fi
-            NS=$(echo "$NAME" | tr '[:upper:]' '[:lower:]')
+            NS=$(echo "$ACCT" | tr '[:upper:]' '[:lower:]')
             echo "Resolved namespace from /api/me: $NS"
+          elif [ -n "$ACCT" ] && [ "$NS" != "$(echo "$ACCT" | tr '[:upper:]' '[:lower:]')" ]; then
+            echo "::warning::Requested namespace '${NS}' but this key belongs to '${ACCT}'."
+            echo "::warning::If the model is yours, it lives under the namespace above."
           fi
           echo "NS=$NS" >> "$GITHUB_ENV"
           echo "TARGET=${NS}/${MODEL_NAME}:${TAG}" >> "$GITHUB_ENV"
